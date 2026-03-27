@@ -37,6 +37,7 @@ db.exec(`
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL,
     schedule            TEXT NOT NULL,
+    timezone            TEXT NOT NULL DEFAULT 'Local',
     command             TEXT NOT NULL,
     working_directory   TEXT NOT NULL DEFAULT '',
     venv_path           TEXT NOT NULL DEFAULT '',
@@ -62,6 +63,8 @@ db.exec(`
   );
 `)
 
+try { db.exec(`ALTER TABLE jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Local';`) } catch (_) {}
+
 // Seed default data on first run (empty DB)
 const jobCount = db.prepare('SELECT COUNT(*) AS n FROM jobs').get()
 if (jobCount.n === 0) {
@@ -69,10 +72,10 @@ if (jobCount.n === 0) {
   const id2 = randomUUID()
   const now  = new Date().toISOString()
 
-  db.prepare(`INSERT INTO jobs (id,name,schedule,command,comment,logging_enabled,timeout_seconds,created_at)
-              VALUES (?,?,?,?,?,1,30,?)`).run(id1, 'Health Check',  '*/5 * * * *', 'echo "health ok"',    'Runs every 5 minutes', now)
-  db.prepare(`INSERT INTO jobs (id,name,schedule,command,comment,logging_enabled,timeout_seconds,created_at)
-              VALUES (?,?,?,?,?,1,300,?)`).run(id2, 'Daily Backup', '0 2 * * *',   'echo "backup complete"', 'Runs at 2 AM daily',   now)
+  db.prepare(`INSERT INTO jobs (id,name,schedule,timezone,command,comment,logging_enabled,timeout_seconds,created_at)
+              VALUES (?,?,?,?,?,?,1,30,?)`).run(id1, 'Health Check',  '*/5 * * * *', 'Local', 'echo "health ok"',    'Runs every 5 minutes', now)
+  db.prepare(`INSERT INTO jobs (id,name,schedule,timezone,command,comment,logging_enabled,timeout_seconds,created_at)
+              VALUES (?,?,?,?,?,?,1,300,?)`).run(id2, 'Daily Backup', '0 2 * * *',   'Local', 'echo "backup complete"', 'Runs at 2 AM daily',   now)
 
   const r1 = randomUUID(), r2 = randomUUID(), r3 = randomUUID()
   const t  = Date.now()
@@ -101,9 +104,9 @@ if (jobCount.n === 0) {
 const stmts = {
   allJobs:       db.prepare('SELECT * FROM jobs ORDER BY created_at DESC'),
   jobById:       db.prepare('SELECT * FROM jobs WHERE id = ?'),
-  insertJob:     db.prepare(`INSERT INTO jobs (id,name,schedule,command,working_directory,venv_path,comment,logging_enabled,timeout_seconds,created_at)
-                              VALUES (?,?,?,?,?,?,?,?,?,?)`),
-  updateJob:     db.prepare(`UPDATE jobs SET name=?,schedule=?,command=?,working_directory=?,venv_path=?,comment=?,logging_enabled=?,timeout_seconds=? WHERE id=?`),
+  insertJob:     db.prepare(`INSERT INTO jobs (id,name,schedule,timezone,command,working_directory,venv_path,comment,logging_enabled,timeout_seconds,created_at)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?)`),
+  updateJob:     db.prepare(`UPDATE jobs SET name=?,schedule=?,timezone=?,command=?,working_directory=?,venv_path=?,comment=?,logging_enabled=?,timeout_seconds=? WHERE id=?`),
   deleteJob:     db.prepare('DELETE FROM jobs WHERE id = ?'),
 
   allScripts:    db.prepare('SELECT * FROM scripts ORDER BY created_at DESC'),
@@ -112,6 +115,16 @@ const stmts = {
   deleteScript:  db.prepare('DELETE FROM scripts WHERE name = ?'),
 
   allRuns:       db.prepare('SELECT * FROM runs ORDER BY started_at DESC LIMIT 100'),
+  runsByFilters: db.prepare(`SELECT * FROM runs
+                              WHERE (?1 = '' OR LOWER(status) = LOWER(?1))
+                                AND (?2 = '' OR LOWER(job_name) LIKE LOWER(?2) OR LOWER(command) LIKE LOWER(?2))
+                                AND (?3 = '' OR job_id = ?3)
+                              ORDER BY started_at DESC
+                              LIMIT ?4 OFFSET ?5`),
+  runsCountByFilters: db.prepare(`SELECT COUNT(*) AS total FROM runs
+                                   WHERE (?1 = '' OR LOWER(status) = LOWER(?1))
+                                     AND (?2 = '' OR LOWER(job_name) LIKE LOWER(?2) OR LOWER(command) LIKE LOWER(?2))
+                                     AND (?3 = '' OR job_id = ?3)`),
   runById:       db.prepare('SELECT * FROM runs WHERE id = ?'),
   insertRun:     db.prepare(`INSERT INTO runs (id,job_id,job_name,command,status,exit_code,stdout,stderr,started_at,ended_at,failure_reason,failure_fix)
                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
@@ -158,7 +171,7 @@ function publish(runId, msg) {
 }
 
 function rowToJob(r) {
-  return { ...r, logging_enabled: r.logging_enabled === 1 }
+  return { ...r, timezone: r.timezone || 'Local', logging_enabled: r.logging_enabled === 1 }
 }
 
 function getDiskStats() {
@@ -333,6 +346,7 @@ const server = http.createServer(async (req, res) => {
     if ((schedule.match(/\S+/g) || []).length !== 5) return json(res, 400, { error: 'invalid cron schedule — must be exactly 5 space-separated fields' })
     stmts.insertJob.run(
       randomUUID(), name, schedule,
+      body.timezone || 'Local',
       command,
       body.working_directory || '',
       body.venv_path || '',
@@ -358,7 +372,7 @@ const server = http.createServer(async (req, res) => {
     if (!command) return json(res, 400, { error: 'command is required' })
     if ((schedule.match(/\S+/g) || []).length !== 5) return json(res, 400, { error: 'invalid cron schedule — must be exactly 5 space-separated fields' })
     stmts.updateJob.run(
-      name, schedule, command,
+      name, schedule, body.timezone || 'Local', command,
       body.working_directory || '',
       body.venv_path  || '',
       body.comment    || '',
@@ -395,7 +409,21 @@ const server = http.createServer(async (req, res) => {
 
   // ── Runs ──────────────────────────────────────────────────────────────────
   if (method === 'GET' && path_ === '/api/runs') {
-    return json(res, 200, stmts.allRuns.all())
+    const status = String(url.searchParams.get('status') || '').trim()
+    const searchRaw = String(url.searchParams.get('search') || '').trim()
+    const jobId = String(url.searchParams.get('job_id') || '').trim()
+    const search = searchRaw ? `%${searchRaw}%` : ''
+    const limit = Math.max(1, Math.min(500, Number.parseInt(String(url.searchParams.get('limit') || '50'), 10) || 50))
+    const offset = Math.max(0, Number.parseInt(String(url.searchParams.get('offset') || '0'), 10) || 0)
+    const totalRow = stmts.runsCountByFilters.get(status === 'all' ? '' : status, search, jobId)
+    const items = stmts.runsByFilters.all(status === 'all' ? '' : status, search, jobId, limit, offset)
+    return json(res, 200, {
+      items,
+      total: totalRow.total || 0,
+      limit,
+      offset,
+      has_more: offset + items.length < (totalRow.total || 0),
+    })
   }
 
   const logsMatch = path_.match(/^\/api\/runs\/([^/]+)\/logs$/)

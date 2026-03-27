@@ -47,6 +47,7 @@ type scriptPayload struct {
 type jobPayload struct {
 	Name           string `json:"name"`
 	Schedule       string `json:"schedule"`
+	Timezone       string `json:"timezone"`
 	WorkingDir     string `json:"working_directory"`
 	Command        string `json:"command"`
 	Comment        string `json:"comment"`
@@ -107,6 +108,7 @@ func main() {
 	r.GET("/api/jobs", a.listJobs)
 	r.GET("/api/jobs/presets", a.jobPresets)
 	r.POST("/api/jobs", a.createJob)
+	r.PUT("/api/jobs/:id", a.updateJob)
 	r.DELETE("/api/jobs/:id", a.deleteJob)
 	r.POST("/api/jobs/:id/run", a.runJobManual)
 	r.GET("/api/runs", a.listRuns)
@@ -152,6 +154,7 @@ create table if not exists cron_jobs (
   id uuid primary key,
   name text not null,
   schedule text not null,
+  timezone text not null default 'Local',
   working_dir text not null default '',
   command text not null,
   comment text not null default '',
@@ -178,6 +181,9 @@ create table if not exists job_runs (
 	}
 	if _, err := a.db.Exec(ctx, "alter table cron_jobs add column if not exists working_dir text not null default ''"); err != nil {
 		return fmt.Errorf("migrate working_dir: %w", err)
+	}
+	if _, err := a.db.Exec(ctx, "alter table cron_jobs add column if not exists timezone text not null default 'Local'"); err != nil {
+		return fmt.Errorf("migrate timezone: %w", err)
 	}
 	return nil
 }
@@ -271,7 +277,7 @@ func (a *app) deleteScript(c *gin.Context) {
 
 func (a *app) listJobs(c *gin.Context) {
 	rows, err := a.db.Query(c,
-		"select id,name,schedule,working_dir,command,comment,logging_enabled,timeout_seconds,created_at from cron_jobs order by created_at desc")
+		"select id,name,schedule,timezone,working_dir,command,comment,logging_enabled,timeout_seconds,created_at from cron_jobs order by created_at desc")
 	if err != nil {
 		slog.Error("listJobs query", "err", err)
 		c.JSON(500, gin.H{"error": "failed to query jobs"})
@@ -282,17 +288,17 @@ func (a *app) listJobs(c *gin.Context) {
 	out := make([]gin.H, 0)
 	for rows.Next() {
 		var id uuid.UUID
-		var name, schedule, workingDir, cmd, comment string
+		var name, schedule, timezone, workingDir, cmd, comment string
 		var logEnabled bool
 		var timeout int
 		var created time.Time
-		if err := rows.Scan(&id, &name, &schedule, &workingDir, &cmd, &comment, &logEnabled, &timeout, &created); err != nil {
+		if err := rows.Scan(&id, &name, &schedule, &timezone, &workingDir, &cmd, &comment, &logEnabled, &timeout, &created); err != nil {
 			slog.Error("listJobs scan", "err", err)
 			c.JSON(500, gin.H{"error": "failed to read job row"})
 			return
 		}
 		out = append(out, gin.H{
-			"id": id, "name": name, "schedule": schedule, "working_directory": workingDir,
+			"id": id, "name": name, "schedule": schedule, "timezone": timezone, "working_directory": workingDir,
 			"command": cmd, "comment": comment, "logging_enabled": logEnabled,
 			"timeout_seconds": timeout, "created_at": created,
 		})
@@ -338,6 +344,16 @@ func (a *app) createJob(c *gin.Context) {
 	if p.TimeoutSeconds <= 0 {
 		p.TimeoutSeconds = 300
 	}
+	timezone := strings.TrimSpace(p.Timezone)
+	if timezone == "" {
+		timezone = "Local"
+	}
+	if timezone != "Local" {
+		if _, err := time.LoadLocation(timezone); err != nil {
+			c.JSON(400, gin.H{"error": "invalid timezone"})
+			return
+		}
+	}
 	workingDir := strings.TrimSpace(p.WorkingDir)
 	if workingDir != "" {
 		if !filepath.IsAbs(workingDir) {
@@ -351,8 +367,8 @@ func (a *app) createJob(c *gin.Context) {
 		}
 	}
 	_, err := a.db.Exec(c,
-		"insert into cron_jobs(id,name,schedule,working_dir,command,comment,logging_enabled,timeout_seconds) values($1,$2,$3,$4,$5,$6,$7,$8)",
-		uuid.New(), p.Name, p.Schedule, workingDir, p.Command, p.Comment, p.LoggingEnabled, p.TimeoutSeconds,
+		"insert into cron_jobs(id,name,schedule,timezone,working_dir,command,comment,logging_enabled,timeout_seconds) values($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+		uuid.New(), p.Name, p.Schedule, timezone, workingDir, p.Command, p.Comment, p.LoggingEnabled, p.TimeoutSeconds,
 	)
 	if err != nil {
 		slog.Error("createJob db insert", "err", err)
@@ -360,6 +376,73 @@ func (a *app) createJob(c *gin.Context) {
 		return
 	}
 	c.JSON(201, gin.H{"ok": true})
+}
+
+func (a *app) updateJob(c *gin.Context) {
+	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(400, gin.H{"error": "invalid job ID format"})
+		return
+	}
+
+	var p jobPayload
+	if err := c.BindJSON(&p); err != nil {
+		c.JSON(400, gin.H{"error": "invalid JSON payload"})
+		return
+	}
+	p.Name = strings.TrimSpace(p.Name)
+	if p.Name == "" {
+		c.JSON(400, gin.H{"error": "job name is required"})
+		return
+	}
+	p.Command = strings.TrimSpace(p.Command)
+	if p.Command == "" {
+		c.JSON(400, gin.H{"error": "command is required"})
+		return
+	}
+	if !isLikelyCron(p.Schedule) {
+		c.JSON(400, gin.H{"error": "invalid cron schedule — must be exactly 5 space-separated fields"})
+		return
+	}
+	if p.TimeoutSeconds <= 0 {
+		p.TimeoutSeconds = 300
+	}
+	timezone := strings.TrimSpace(p.Timezone)
+	if timezone == "" {
+		timezone = "Local"
+	}
+	if timezone != "Local" {
+		if _, err := time.LoadLocation(timezone); err != nil {
+			c.JSON(400, gin.H{"error": "invalid timezone"})
+			return
+		}
+	}
+	workingDir := strings.TrimSpace(p.WorkingDir)
+	if workingDir != "" {
+		if !filepath.IsAbs(workingDir) {
+			c.JSON(400, gin.H{"error": "working_directory must be an absolute path"})
+			return
+		}
+		info, err := os.Stat(workingDir)
+		if err != nil || !info.IsDir() {
+			c.JSON(400, gin.H{"error": "working_directory does not exist or is not a directory"})
+			return
+		}
+	}
+	tag, err := a.db.Exec(c,
+		"update cron_jobs set name=$2,schedule=$3,timezone=$4,working_dir=$5,command=$6,comment=$7,logging_enabled=$8,timeout_seconds=$9 where id=$1",
+		id, p.Name, p.Schedule, timezone, workingDir, p.Command, p.Comment, p.LoggingEnabled, p.TimeoutSeconds,
+	)
+	if err != nil {
+		slog.Error("updateJob db update", "id", id, "err", err)
+		c.JSON(500, gin.H{"error": "failed to update job"})
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		c.JSON(404, gin.H{"error": "job not found"})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
 }
 
 func (a *app) deleteJob(c *gin.Context) {
@@ -399,15 +482,24 @@ func (a *app) runJobManual(c *gin.Context) {
 		return
 	}
 	if loggingEnabled {
+		runID := uuid.New()
+		if _, err := a.db.Exec(c,
+			"insert into job_runs(id,job_id,job_name,command,status,started_at) values($1,$2,$3,$4,'running',$5)",
+			runID, jobID, name, command, time.Now(),
+		); err != nil {
+			slog.Error("runJobManual insert run record", "job", name, "err", err)
+			c.JSON(500, gin.H{"error": "failed to start job"})
+			return
+		}
 		go func() {
-			if _, err := a.executeJob(context.Background(), jobID, name, workingDir, command, timeout); err != nil {
+			if _, err := a.executeJob(context.Background(), jobID, name, workingDir, command, timeout, &runID); err != nil {
 				slog.Error("background job execution failed", "job", name, "err", err)
 			}
 		}()
-		c.JSON(202, gin.H{"status": "started_in_background"})
+		c.JSON(202, gin.H{"status": "started_in_background", "run_id": runID})
 		return
 	}
-	runID, err := a.executeJob(c, jobID, name, workingDir, command, timeout)
+	runID, err := a.executeJob(c, jobID, name, workingDir, command, timeout, nil)
 	if err != nil {
 		slog.Error("manual job execution failed", "job", name, "err", err)
 		c.JSON(500, gin.H{"error": "job execution failed: " + err.Error()})
@@ -416,14 +508,18 @@ func (a *app) runJobManual(c *gin.Context) {
 	c.JSON(200, gin.H{"run_id": runID})
 }
 
-func (a *app) executeJob(ctx context.Context, jobID uuid.UUID, name, workingDir, command string, timeoutSeconds int) (uuid.UUID, error) {
+func (a *app) executeJob(ctx context.Context, jobID uuid.UUID, name, workingDir, command string, timeoutSeconds int, existingRunID *uuid.UUID) (uuid.UUID, error) {
 	runID := uuid.New()
-	started := time.Now()
-	if _, err := a.db.Exec(ctx,
-		"insert into job_runs(id,job_id,job_name,command,status,started_at) values($1,$2,$3,$4,'running',$5)",
-		runID, jobID, name, command, started,
-	); err != nil {
-		return uuid.Nil, fmt.Errorf("insert run record: %w", err)
+	if existingRunID != nil {
+		runID = *existingRunID
+	} else {
+		started := time.Now()
+		if _, err := a.db.Exec(ctx,
+			"insert into job_runs(id,job_id,job_name,command,status,started_at) values($1,$2,$3,$4,'running',$5)",
+			runID, jobID, name, command, started,
+		); err != nil {
+			return uuid.Nil, fmt.Errorf("insert run record: %w", err)
+		}
 	}
 	a.publish(runID.String(), `{"status":"running"}`)
 
@@ -515,8 +611,54 @@ func (a *app) markRunFailed(runID uuid.UUID, reason, fix string) {
 }
 
 func (a *app) listRuns(c *gin.Context) {
+	limit := parseIntParam(c.Query("limit"), 50, 1, 500)
+	offset := parseIntParam(c.Query("offset"), 0, 0, 1_000_000)
+	status := strings.TrimSpace(strings.ToLower(c.Query("status")))
+	search := strings.TrimSpace(c.Query("search"))
+	jobID := strings.TrimSpace(c.Query("job_id"))
+
+	where := make([]string, 0, 3)
+	args := make([]any, 0, 6)
+	argN := 1
+
+	if status != "" && status != "all" {
+		where = append(where, fmt.Sprintf("lower(status) = $%d", argN))
+		args = append(args, status)
+		argN++
+	}
+	if search != "" {
+		where = append(where, fmt.Sprintf("(job_name ilike $%d or command ilike $%d)", argN, argN))
+		args = append(args, "%"+search+"%")
+		argN++
+	}
+	if jobID != "" {
+		if _, err := uuid.Parse(jobID); err != nil {
+			c.JSON(400, gin.H{"error": "invalid job ID format"})
+			return
+		}
+		where = append(where, fmt.Sprintf("job_id = $%d", argN))
+		args = append(args, jobID)
+		argN++
+	}
+
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " where " + strings.Join(where, " and ")
+	}
+
+	countSQL := "select count(*) from job_runs" + whereSQL
+	var total int
+	if err := a.db.QueryRow(c, countSQL, args...).Scan(&total); err != nil {
+		slog.Error("listRuns count query", "err", err)
+		c.JSON(500, gin.H{"error": "failed to count runs"})
+		return
+	}
+
+	args = append(args, limit, offset)
 	rows, err := a.db.Query(c,
-		"select id,job_id,job_name,command,status,exit_code,started_at,ended_at,failure_reason,failure_fix from job_runs order by started_at desc limit 100")
+		"select id,job_id,job_name,command,status,exit_code,started_at,ended_at,failure_reason,failure_fix from job_runs"+whereSQL+" order by started_at desc limit $"+strconv.Itoa(argN)+" offset $"+strconv.Itoa(argN+1),
+		args...,
+	)
 	if err != nil {
 		slog.Error("listRuns query", "err", err)
 		c.JSON(500, gin.H{"error": "failed to query runs"})
@@ -548,7 +690,31 @@ func (a *app) listRuns(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "error iterating runs"})
 		return
 	}
-	c.JSON(200, out)
+	hasMore := offset+len(out) < total
+	c.JSON(200, gin.H{
+		"items":    out,
+		"total":    total,
+		"limit":    limit,
+		"offset":   offset,
+		"has_more": hasMore,
+	})
+}
+
+func parseIntParam(raw string, fallback, min, max int) int {
+	if strings.TrimSpace(raw) == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func (a *app) getRunLogs(c *gin.Context) {
@@ -567,6 +733,27 @@ func (a *app) getRunLogs(c *gin.Context) {
 
 func (a *app) streamRun(c *gin.Context) {
 	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(400, gin.H{"error": "invalid run ID format"})
+		return
+	}
+	var status string
+	var stdout, stderr string
+	var exitCode *int
+	var endedAt *time.Time
+	if err := a.db.QueryRow(c, "select status,stdout,stderr,exit_code,ended_at from job_runs where id=$1", id).Scan(&status, &stdout, &stderr, &exitCode, &endedAt); err != nil {
+		c.JSON(404, gin.H{"error": "run not found"})
+		return
+	}
+
+	if endedAt != nil || !strings.EqualFold(status, "running") {
+		c.Writer.Header().Set("Content-Type", "text/event-stream")
+		c.Writer.Header().Set("Cache-Control", "no-cache")
+		c.Writer.Header().Set("Connection", "keep-alive")
+		c.SSEvent("message", gin.H{"status": status, "stdout": stdout, "stderr": stderr, "exit_code": exitCode})
+		return
+	}
+
 	ch := make(chan string, 16)
 	a.mu.Lock()
 	a.subscribers[id] = append(a.subscribers[id], ch)
@@ -601,11 +788,12 @@ func (a *app) streamRun(c *gin.Context) {
 
 func (a *app) publish(runID, message string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	for _, ch := range a.subscribers[runID] {
+	subs := append([]chan string(nil), a.subscribers[runID]...)
+	a.mu.Unlock()
+	for _, ch := range subs {
 		select {
 		case ch <- message:
-		default:
+		case <-time.After(120 * time.Millisecond):
 		}
 	}
 }
@@ -635,13 +823,17 @@ func (a *app) systemInfo(c *gin.Context) {
 }
 
 func (a *app) schedulerLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			now := time.Now()
+			if now.Second() != 0 {
+				continue
+			}
 			if err := a.runDueJobs(context.Background()); err != nil {
 				slog.Error("scheduler tick failed", "err", err)
 			}
@@ -670,7 +862,7 @@ func (a *app) cleanupLoop(ctx context.Context, retention time.Duration) {
 
 func (a *app) runDueJobs(ctx context.Context) error {
 	rows, err := a.db.Query(ctx,
-		"select id,name,schedule,working_dir,command,logging_enabled,timeout_seconds from cron_jobs")
+		"select id,name,schedule,timezone,working_dir,command,logging_enabled,timeout_seconds from cron_jobs")
 	if err != nil {
 		return fmt.Errorf("query due jobs: %w", err)
 	}
@@ -679,14 +871,21 @@ func (a *app) runDueJobs(ctx context.Context) error {
 	now := time.Now()
 	for rows.Next() {
 		var id uuid.UUID
-		var name, schedule, workingDir, command string
+		var name, schedule, timezone, workingDir, command string
 		var loggingEnabled bool
 		var timeout int
-		if err := rows.Scan(&id, &name, &schedule, &workingDir, &command, &loggingEnabled, &timeout); err != nil {
+		if err := rows.Scan(&id, &name, &schedule, &timezone, &workingDir, &command, &loggingEnabled, &timeout); err != nil {
 			slog.Error("runDueJobs scan", "err", err)
 			continue
 		}
-		if !matchesCron(schedule, now) {
+		loc := time.Local
+		if strings.TrimSpace(timezone) != "" && timezone != "Local" {
+			if loaded, err := time.LoadLocation(timezone); err == nil {
+				loc = loaded
+			}
+		}
+		jobNow := now.In(loc)
+		if !matchesCron(schedule, jobNow) {
 			continue
 		}
 		a.mu.Lock()
@@ -700,12 +899,12 @@ func (a *app) runDueJobs(ctx context.Context) error {
 
 		if loggingEnabled {
 			go func(id uuid.UUID, name, workingDir, command string, timeout int) {
-				if _, err := a.executeJob(context.Background(), id, name, workingDir, command, timeout); err != nil {
+				if _, err := a.executeJob(context.Background(), id, name, workingDir, command, timeout, nil); err != nil {
 					slog.Error("scheduled job failed", "job", name, "err", err)
 				}
 			}(id, name, workingDir, command, timeout)
 		} else {
-			if _, err := a.executeJob(context.Background(), id, name, workingDir, command, timeout); err != nil {
+			if _, err := a.executeJob(context.Background(), id, name, workingDir, command, timeout, nil); err != nil {
 				slog.Error("scheduled job failed", "job", name, "err", err)
 			}
 		}

@@ -11,6 +11,7 @@ create table if not exists cron_jobs (
   id uuid primary key default uuid_generate_v4(),
   name text not null,
   schedule text not null,
+  timezone text not null default 'Local',
   working_dir text not null default '',
   command text not null,
   comment text not null default '',

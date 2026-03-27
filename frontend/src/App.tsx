@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   AlertCircle,
@@ -44,8 +44,13 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-
-const API = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080'
+import { API_BASE_URL, apiFetch } from '@/lib/api'
+import { getUxMetricsSnapshot, markJobCreateStarted, markJobCreated, markJobRunStarted, markLogsOpened } from '@/lib/uxMetrics'
+import { isRunFailure, isRunSuccess } from '@/features/runs/status'
+import { validateCron, validateJobName, validateCommand } from '@/features/jobs/validators'
+import { validateScriptName } from '@/features/scripts/validators'
+import { formatCountdown, nextRunFromCron } from '@/features/jobs/time'
+import { MainTabs } from '@/features/layout/MainTabs'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -63,6 +68,7 @@ type SystemInfo   = {
 type Script = { name: string; content: string; created_at: string }
 type Job = {
   id: string; name: string; schedule: string
+  timezone?: string
   command: string; working_directory?: string; venv_path?: string; comment: string
   logging_enabled: boolean; timeout_seconds: number
 }
@@ -76,43 +82,10 @@ type Run = {
 type Preset = { label: string; schedule: string }
 type Tab = 'jobs' | 'scripts' | 'runs'
 type ScheduleMode = 'cron' | 'human' | 'both'
-
-// ─── API helper ─────────────────────────────────────────────────────────────
-
-async function apiFetch<T = unknown>(url: string, opts?: RequestInit): Promise<T> {
-  let res: Response
-  try { res = await fetch(url, opts) } catch {
-    throw new Error('Cannot reach the server — check your connection')
-  }
-  if (!res.ok) {
-    let msg = `Server error (${res.status})`
-    try {
-      const body = (await res.json()) as { error?: string }
-      if (body?.error) msg = body.error
-    } catch { /* keep generic message */ }
-    throw new Error(msg)
-  }
-  const text = await res.text()
-  return (text ? JSON.parse(text) : null) as T
-}
-
-// ─── Validators ─────────────────────────────────────────────────────────────
-
-const SCRIPT_NAME_RE = /^[a-zA-Z0-9._-]+$/
-const CRON_RE = /^(\S+\s+){4}\S+$/
-
-function validateScriptName(n: string) {
-  if (!n.trim()) return 'Script name is required'
-  if (!SCRIPT_NAME_RE.test(n.trim())) return 'Only letters, digits, dots, hyphens, underscores'
-  return ''
-}
-function validateCron(s: string) {
-  if (!s.trim()) return 'Schedule is required'
-  if (!CRON_RE.test(s.trim())) return '5 space-separated cron fields required'
-  return ''
-}
-function validateJobName(n: string) { return n.trim() ? '' : 'Job name is required' }
-function validateCommand(c: string) { return c.trim() ? '' : 'Command is required' }
+type RunsResponse = { items: Run[]; total: number; limit: number; offset: number; has_more: boolean }
+const VALID_TABS: Tab[] = ['jobs', 'scripts', 'runs']
+const VALID_RUN_FILTERS = ['all', 'running', 'success', 'failed'] as const
+type RunsFilter = (typeof VALID_RUN_FILTERS)[number]
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -153,6 +126,34 @@ function formatLogSize(stdout: string, stderr: string) {
   return `${bytes} B`
 }
 
+function parsePositiveInt(raw: string | null, fallback: number, min: number, max: number): number {
+  const parsed = Number.parseInt(String(raw ?? ''), 10)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
+function getInitialUiStateFromUrl() {
+  if (typeof window === 'undefined') {
+    return {
+      activeTab: 'jobs' as Tab,
+      runsFilter: 'all' as RunsFilter,
+      runsSearch: '',
+      runsPageSize: 50,
+      runsOffset: 0,
+    }
+  }
+  const params = new URLSearchParams(window.location.search)
+  const tabParam = params.get('tab')
+  const runsFilterParam = params.get('runsFilter')
+  return {
+    activeTab: (VALID_TABS.includes(tabParam as Tab) ? tabParam : 'jobs') as Tab,
+    runsFilter: (VALID_RUN_FILTERS.includes(runsFilterParam as RunsFilter) ? runsFilterParam : 'all') as RunsFilter,
+    runsSearch: params.get('runsSearch') ?? '',
+    runsPageSize: parsePositiveInt(params.get('runsPageSize'), 50, 25, 100),
+    runsOffset: parsePositiveInt(params.get('runsOffset'), 0, 0, 1_000_000),
+  }
+}
+
 // ─── Pure sub-components ─────────────────────────────────────────────────────
 
 function ProgressBar({ pct, warn = 70, danger = 90 }: { pct: number; warn?: number; danger?: number }) {
@@ -190,9 +191,9 @@ function RunDots({ jobId, runs }: { jobId: string; runs: Run[] }) {
 /** Status badge: color + icon, never color alone. */
 function RunBadge({ status }: { status: string }) {
   const s = status.toLowerCase()
-  if (['success', 'ok', 'completed'].includes(s))
+  if (isRunSuccess(status))
     return <Badge className="bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-50 gap-1 text-[10px]"><Check className="h-2.5 w-2.5" />{status}</Badge>
-  if (s.includes('fail') || s.includes('error'))
+  if (isRunFailure(status))
     return <Badge variant="destructive" className="gap-1 text-[10px]"><X className="h-2.5 w-2.5" />{status}</Badge>
   if (['running', 'pending', 'started'].includes(s))
     return <Badge className="bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-50 gap-1 text-[10px]"><Loader2 className="h-2.5 w-2.5 motion-safe:animate-spin" />{status}</Badge>
@@ -262,15 +263,19 @@ function CronExpressionHelper({
   errors,
   id,
   presets,
+  timezone,
 }: {
   value: string
   onChange: (v: string) => void
   errors?: string
   id: string
   presets?: { label: string; schedule: string }[]
+  timezone?: string
 }) {
   const [showPatterns, setShowPatterns] = useState(false)
   const [patternSearch, setPatternSearch] = useState('')
+  const [clockTime, setClockTime] = useState('09:00')
+  const [clockMode, setClockMode] = useState<'daily' | 'weekdays' | 'weekly-sunday'>('daily')
 
   const explanation = (() => {
     try {
@@ -322,6 +327,44 @@ function CronExpressionHelper({
             <SelectContent>{presets.map(p => <SelectItem key={p.schedule} value={p.schedule} className="text-xs">{p.label}</SelectItem>)}</SelectContent>
           </Select>
         )}
+      </div>
+      <div className="rounded border border-border/50 bg-white p-2">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-[11px] font-semibold text-muted-foreground">Clock Helper</span>
+          <span className="text-[10px] text-muted-foreground">TZ: {timezone || 'Local'}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <input
+            type="time"
+            value={clockTime}
+            onChange={e => setClockTime(e.target.value)}
+            className="h-8 rounded-md border border-border/60 px-2 text-xs"
+          />
+          <Select value={clockMode} onValueChange={v => setClockMode(v as typeof clockMode)}>
+            <SelectTrigger className="h-8 w-36 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="daily">Daily</SelectItem>
+              <SelectItem value="weekdays">Weekdays</SelectItem>
+              <SelectItem value="weekly-sunday">Weekly (Sunday)</SelectItem>
+            </SelectContent>
+          </Select>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 text-xs"
+            onClick={() => {
+              const [hhRaw, mmRaw] = clockTime.split(':')
+              const hh = Number.parseInt(hhRaw, 10)
+              const mm = Number.parseInt(mmRaw, 10)
+              if (!Number.isFinite(hh) || !Number.isFinite(mm)) return
+              const dow = clockMode === 'daily' ? '*' : clockMode === 'weekdays' ? '1-5' : '0'
+              onChange(`${mm} ${hh} * * ${dow}`)
+            }}
+          >
+            Use clock
+          </Button>
+        </div>
       </div>
 
       {/* Human-readable explanation */}
@@ -389,6 +432,8 @@ function CronExpressionHelper({
 // ─── Main App ────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const initialUiState = useMemo(() => getInitialUiStateFromUrl(), [])
+
   // ── Data state ────────────────────────────────────────────────────────────
   const [scripts, setScripts]   = useState<Script[]>([])
   const [jobs, setJobs]         = useState<Job[]>([])
@@ -401,7 +446,7 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false)
 
   // ── UI state ──────────────────────────────────────────────────────────────
-  const [activeTab, setActiveTab]         = useState<Tab>('jobs')
+  const [activeTab, setActiveTab]         = useState<Tab>(initialUiState.activeTab)
   const [sidebarOpen, setSidebarOpen]     = useState(true)
   const [minimalMode, setMinimalMode]     = useState(() => {
     try { return localStorage.getItem('cronsentinel-minimal-mode') === 'true' } catch { return false }
@@ -413,8 +458,16 @@ export default function App() {
     } catch { return 'both' }
   })
   const [jobSearch, setJobSearch]         = useState('')
-  const [runsFilter, setRunsFilter]       = useState<'all' | 'running' | 'success' | 'failed'>('all')
+  const [runsFilter, setRunsFilter]       = useState<RunsFilter>(initialUiState.runsFilter)
+  const [runsSearch, setRunsSearch]       = useState(initialUiState.runsSearch)
+  const [runsPageSize, setRunsPageSize]   = useState(initialUiState.runsPageSize)
+  const [runsOffset, setRunsOffset]       = useState(initialUiState.runsOffset)
+  const [runsTotal, setRunsTotal]         = useState(0)
+  const [runsHasMore, setRunsHasMore]     = useState(false)
+  const [runsCompactMode, setRunsCompactMode] = useState(false)
   const [showJobForm, setShowJobForm]     = useState(false)
+  const [showJobAdvanced, setShowJobAdvanced] = useState(false)
+  const [showEditAdvanced, setShowEditAdvanced] = useState(false)
   const [showScriptForm, setShowScriptForm] = useState(false)
   const [selectedRun, setSelectedRun]     = useState<string>('')
   const [logsLoading, setLogsLoading]     = useState(false)
@@ -424,6 +477,8 @@ export default function App() {
   const [modalLogsLoading, setModalLogsLoading] = useState(false)
   const [modalLogs, setModalLogs] = useState({ stdout: '', stderr: '' })
   const [logsModalAutoFollow, setLogsModalAutoFollow] = useState(false)
+  const logsModalTitleId = useId()
+  const logsModalDescriptionId = useId()
 
   // ── Per-action loading ────────────────────────────────────────────────────
   const [scriptSaving, setScriptSaving]     = useState(false)
@@ -434,7 +489,7 @@ export default function App() {
 
   // ── Edit job ──────────────────────────────────────────────────────────────
   const [editingJobId, setEditingJobId]   = useState<string | null>(null)
-  const [editJob, setEditJob]             = useState({ name: '', schedule: '', command: '', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300 })
+  const [editJob, setEditJob]             = useState({ name: '', schedule: '', timezone: 'Local', command: '', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300 })
   const [editJobErrors, setEditJobErrors] = useState({ name: '', schedule: '', command: '' })
   const [editJobSaving, setEditJobSaving] = useState(false)
 
@@ -446,7 +501,7 @@ export default function App() {
   const [newScript, setNewScript] = useState({ name: '', content: 'echo "hello from script"' })
   const [newJob, setNewJob]       = useState({
     name: '', schedule: '*/5 * * * *', command: 'echo "cron test"',
-    working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300,
+    timezone: 'Local', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300,
   })
   const [scriptErrors, setScriptErrors] = useState({ name: '' })
   const [jobErrors, setJobErrors]       = useState({ name: '', schedule: '', command: '' })
@@ -455,26 +510,69 @@ export default function App() {
   const refresh = useCallback(async (showSpinner = false) => {
     if (showSpinner) setRefreshing(true)
     try {
+      const runsParams = new URLSearchParams({
+        limit: String(runsPageSize),
+        offset: String(runsOffset),
+        status: runsFilter,
+      })
+      if (runsSearch.trim()) runsParams.set('search', runsSearch.trim())
       const [sc, jb, ru, sy, pr] = await Promise.all([
-        apiFetch<Script[]>(`${API}/api/scripts`),
-        apiFetch<Job[]>(`${API}/api/jobs`),
-        apiFetch<Run[]>(`${API}/api/runs`),
-        apiFetch<SystemInfo>(`${API}/api/system`),
-        apiFetch<Preset[]>(`${API}/api/jobs/presets`),
+        apiFetch<Script[]>(`${API_BASE_URL}/api/scripts`),
+        apiFetch<Job[]>(`${API_BASE_URL}/api/jobs`),
+        apiFetch<RunsResponse>(`${API_BASE_URL}/api/runs?${runsParams.toString()}`),
+        apiFetch<SystemInfo>(`${API_BASE_URL}/api/system`),
+        apiFetch<Preset[]>(`${API_BASE_URL}/api/jobs/presets`),
       ])
-      setScripts(sc ?? []); setJobs(jb ?? []); setRuns(ru ?? [])
+      setScripts(sc ?? []); setJobs(jb ?? []); setRuns(ru?.items ?? [])
+      setRunsTotal(ru?.total ?? 0)
+      setRunsHasMore(Boolean(ru?.has_more))
       setSystem(sy ?? {}); setPresets(pr ?? [])
       setApiOnline(true)
     } catch (err) {
       setApiOnline(false)
       if (showSpinner) toast.error('Refresh failed', { description: err instanceof Error ? err.message : 'Unknown error' })
     } finally { if (showSpinner) setRefreshing(false) }
-  }, [])
+  }, [runsFilter, runsOffset, runsPageSize, runsSearch])
 
   useEffect(() => { refresh(); const t = setInterval(() => refresh(), 5000); return () => clearInterval(t) }, [refresh])
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    params.set('tab', activeTab)
+    if (activeTab === 'runs') {
+      params.set('runsFilter', runsFilter)
+      if (runsSearch.trim()) params.set('runsSearch', runsSearch.trim())
+      else params.delete('runsSearch')
+      params.set('runsPageSize', String(runsPageSize))
+      params.set('runsOffset', String(runsOffset))
+    } else {
+      params.delete('runsFilter')
+      params.delete('runsSearch')
+      params.delete('runsPageSize')
+      params.delete('runsOffset')
+    }
+    const nextUrl = `${window.location.pathname}?${params.toString()}${window.location.hash}`
+    window.history.replaceState(null, '', nextUrl)
+  }, [activeTab, runsFilter, runsSearch, runsPageSize, runsOffset])
+
+  useEffect(() => {
+    const onPopState = () => {
+      const ui = getInitialUiStateFromUrl()
+      setActiveTab(ui.activeTab)
+      setRunsFilter(ui.runsFilter)
+      setRunsSearch(ui.runsSearch)
+      setRunsPageSize(ui.runsPageSize)
+      setRunsOffset(ui.runsOffset)
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
   useEffect(() => { try { localStorage.setItem('cronsentinel-minimal-mode', String(minimalMode)) } catch { /* */ } }, [minimalMode])
   useEffect(() => { try { localStorage.setItem('cronsentinel-schedule-mode', scheduleMode) } catch { /* */ } }, [scheduleMode])
+  useEffect(() => {
+    if (showJobForm) markJobCreateStarted()
+  }, [showJobForm])
 
   // ── Log streaming ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -483,7 +581,7 @@ export default function App() {
     setLogs({ stdout: '', stderr: '' })
     let cancelled = false
 
-    const ev = new EventSource(`${API}/api/runs/${selectedRun}/stream`)
+    const ev = new EventSource(`${API_BASE_URL}/api/runs/${selectedRun}/stream`)
     let streamReceived = false
 
     ev.onmessage = (msg) => {
@@ -500,7 +598,7 @@ export default function App() {
     }
     ev.onerror = () => ev.close()
 
-    apiFetch<{ stdout: string; stderr: string }>(`${API}/api/runs/${selectedRun}/logs`)
+    apiFetch<{ stdout: string; stderr: string }>(`${API_BASE_URL}/api/runs/${selectedRun}/logs`)
       .then(d => {
         if (cancelled) return
         if (!streamReceived) setLogs(d ?? { stdout: '', stderr: '' })
@@ -532,7 +630,7 @@ export default function App() {
     // Open the SSE stream FIRST so we never miss live lines due to the race
     // between job execution and the initial /logs fetch completing.
     // The backend will immediately replay the final state if the run already finished.
-    const ev = new EventSource(`${API}/api/runs/${logsModalRunId}/stream`)
+    const ev = new EventSource(`${API_BASE_URL}/api/runs/${logsModalRunId}/stream`)
     let streamReceived = false
 
     ev.onmessage = (msg) => {
@@ -550,7 +648,7 @@ export default function App() {
     ev.onerror = () => ev.close()
 
     // Also fetch existing logs as a fallback for completed runs where SSE may not fire
-    apiFetch<{ stdout: string; stderr: string }>(`${API}/api/runs/${logsModalRunId}/logs`)
+    apiFetch<{ stdout: string; stderr: string }>(`${API_BASE_URL}/api/runs/${logsModalRunId}/logs`)
       .then(d => {
         if (cancelled) return
         // Only use REST snapshot if SSE hasn't delivered a full payload yet
@@ -569,10 +667,13 @@ export default function App() {
   }, [logsModalRunId])
 
   // ── Derived ───────────────────────────────────────────────────────────────
-  const successCount    = runs.filter(r => ['success', 'ok', 'completed'].includes(r.status.toLowerCase())).length
-  const failedCount     = runs.filter(r => r.status.toLowerCase().includes('fail') || r.status.toLowerCase().includes('error')).length
+  const pageSuccessCount = runs.filter(r => isRunSuccess(r.status)).length
+  const pageFailedCount = runs.filter(r => isRunFailure(r.status)).length
   const selectedRunData = runs.find(r => r.id === selectedRun) ?? null
-  const modalRuns = logsModalJobId ? runs.filter(r => r.job_id === logsModalJobId) : []
+  const modalRuns = useMemo(
+    () => (logsModalJobId ? runs.filter(r => r.job_id === logsModalJobId) : []),
+    [logsModalJobId, runs],
+  )
   const modalJob = logsModalJobId ? jobs.find(j => j.id === logsModalJobId) : null
   const selectedModalRun = modalRuns.find(r => r.id === logsModalRunId) ?? null
   const runningModalRun = modalRuns.find(r => r.status.toLowerCase() === 'running') ?? null
@@ -585,6 +686,9 @@ export default function App() {
     : jobs
 
   const runningJobsCount = runs.filter(r => r.status.toLowerCase() === 'running').length
+  const runsRangeLabel = runsTotal === 0
+    ? '0 of 0'
+    : `${runsOffset + 1}-${Math.min(runsOffset + runs.length, runsTotal)} of ${runsTotal}`
 
   // ── Actions ───────────────────────────────────────────────────────────────
   const saveScript = async () => {
@@ -592,7 +696,7 @@ export default function App() {
     if (e) { setScriptErrors({ name: e }); return }
     setScriptErrors({ name: '' }); setScriptSaving(true)
     try {
-      await apiFetch(`${API}/api/scripts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newScript) })
+      await apiFetch(`${API_BASE_URL}/api/scripts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newScript) })
       toast.success('Script saved', { description: newScript.name })
       setNewScript({ name: '', content: 'echo "hello from script"' })
       setShowScriptForm(false); refresh()
@@ -607,7 +711,7 @@ export default function App() {
   const deleteScript = async (name: string) => {
     setConfirmDeleteScript(null); setDeletingScript(name)
     try {
-      await apiFetch(`${API}/api/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' })
+      await apiFetch(`${API_BASE_URL}/api/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' })
       toast.success('Script deleted', { description: name }); refresh()
     } catch (err) { toast.error('Failed to delete script', { description: err instanceof Error ? err.message : 'Unknown error' })
     } finally { setDeletingScript(null) }
@@ -618,9 +722,10 @@ export default function App() {
     if (ne || se || ce) { setJobErrors({ name: ne, schedule: se, command: ce }); return }
     setJobErrors({ name: '', schedule: '', command: '' }); setJobSaving(true)
     try {
-      await apiFetch(`${API}/api/jobs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newJob) })
+      await apiFetch(`${API_BASE_URL}/api/jobs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newJob) })
       toast.success('Job created', { description: newJob.name })
-      setNewJob({ name: '', schedule: '*/5 * * * *', command: 'echo "cron test"', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300 })
+      markJobCreated()
+      setNewJob({ name: '', schedule: '*/5 * * * *', timezone: 'Local', command: 'echo "cron test"', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300 })
       setShowJobForm(false); refresh()
     } catch (err) { toast.error('Failed to create job', { description: err instanceof Error ? err.message : 'Unknown error' })
     } finally { setJobSaving(false) }
@@ -633,7 +738,7 @@ export default function App() {
   const deleteJob = async (id: string, name: string) => {
     setConfirmDeleteJob(null); setDeletingJob(id)
     try {
-      await apiFetch(`${API}/api/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      await apiFetch(`${API_BASE_URL}/api/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' })
       toast.success('Job deleted', { description: name }); refresh()
     } catch (err) { toast.error('Failed to delete job', { description: err instanceof Error ? err.message : 'Unknown error' })
     } finally { setDeletingJob(null) }
@@ -641,7 +746,8 @@ export default function App() {
 
   const startEditJob = (j: Job) => {
     setEditingJobId(j.id)
-    setEditJob({ name: j.name, schedule: j.schedule, command: j.command, working_directory: j.working_directory ?? '', venv_path: j.venv_path ?? '', comment: j.comment, logging_enabled: j.logging_enabled, timeout_seconds: j.timeout_seconds })
+    setShowEditAdvanced(false)
+    setEditJob({ name: j.name, schedule: j.schedule, timezone: j.timezone ?? 'Local', command: j.command, working_directory: j.working_directory ?? '', venv_path: j.venv_path ?? '', comment: j.comment, logging_enabled: j.logging_enabled, timeout_seconds: j.timeout_seconds })
     setEditJobErrors({ name: '', schedule: '', command: '' })
   }
 
@@ -650,7 +756,7 @@ export default function App() {
     if (ne || se || ce) { setEditJobErrors({ name: ne, schedule: se, command: ce }); return }
     setEditJobErrors({ name: '', schedule: '', command: '' }); setEditJobSaving(true)
     try {
-      await apiFetch(`${API}/api/jobs/${encodeURIComponent(editingJobId!)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(editJob) })
+      await apiFetch(`${API_BASE_URL}/api/jobs/${encodeURIComponent(editingJobId!)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(editJob) })
       toast.success('Job updated'); setEditingJobId(null); refresh()
     } catch (err) { toast.error('Failed to update job', { description: err instanceof Error ? err.message : 'Unknown error' })
     } finally { setEditJobSaving(false) }
@@ -659,8 +765,9 @@ export default function App() {
   const runJob = async (id: string, name: string) => {
     setRunningJob(id)
     try {
-      const resp = await apiFetch<{ run_id?: string }>(`${API}/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST' })
+      const resp = await apiFetch<{ run_id?: string }>(`${API_BASE_URL}/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST' })
       toast.success('Job started', { description: name })
+      markJobRunStarted()
       refresh()
       setLogsModalJobId(id)
       if (resp?.run_id) setLogsModalRunId(resp.run_id)
@@ -673,6 +780,7 @@ export default function App() {
     setNewJob({
       name: `${j.name}-copy`,
       schedule: j.schedule,
+      timezone: j.timezone ?? 'Local',
       command: j.command,
       working_directory: j.working_directory ?? '',
       venv_path: j.venv_path ?? '',
@@ -695,10 +803,12 @@ export default function App() {
   }
 
   const openLogsModal = (jobId: string) => {
+    const openedAt = Date.now()
     const latestRun = runs.find(r => r.job_id === jobId)
     setLogsModalJobId(jobId)
     setLogsModalRunId(latestRun?.id ?? '')
     setLogsModalAutoFollow(false)
+    markLogsOpened(openedAt)
   }
 
   useEffect(() => {
@@ -739,16 +849,24 @@ export default function App() {
   }, [logsModalJobId])
 
   const memPct = system.memory?.usedPercent ?? 0
+  const uxMetrics = getUxMetricsSnapshot()
+  const nextRunByJob = useMemo(() => {
+    const out: Record<string, Date | null> = {}
+    for (const job of jobs) {
+      out[job.id] = nextRunFromCron(job.schedule, job.timezone || 'Local')
+    }
+    return out
+  }, [jobs])
 
   // ══════════════════════════════════════════════════════════════════════════
   return (
-    <div className="h-screen overflow-hidden flex flex-col bg-[#f5f5f2] text-foreground">
+    <div className="h-screen overflow-hidden flex flex-col bg-background text-foreground">
 
       {/* ── Offline banner ── */}
       {apiOnline === false && (
         <div role="alert" aria-live="assertive" className="flex items-center justify-center gap-2 bg-destructive/10 border-b border-destructive/20 px-4 py-1.5 text-destructive text-xs font-medium shrink-0">
           <WifiOff className="h-3.5 w-3.5" aria-hidden="true" />
-          Cannot reach the backend — retrying automatically…
+          Backend is unreachable. Auto-retrying every 5s, or click Refresh now.
         </div>
       )}
 
@@ -807,7 +925,7 @@ export default function App() {
 
         {/* ── Left sidebar ───────────────────────────────────────────────── */}
         {sidebarOpen && (
-          <aside className="w-52 shrink-0 border-r border-border/40 bg-[#efefe9] flex flex-col overflow-y-auto">
+          <aside className="w-52 shrink-0 border-r border-border/40 bg-muted/40 flex flex-col overflow-y-auto">
 
             {/* System status */}
             <div className="px-4 pt-4 pb-3 border-b border-border/40">
@@ -918,6 +1036,18 @@ export default function App() {
                   </div>
                 )}
 
+                <div className="rounded border border-border/40 bg-white/60 px-2.5 py-2">
+                  <div className="flex items-center gap-1.5 mb-1.5">
+                    <Info className="h-3 w-3 text-muted-foreground" aria-hidden="true" />
+                    <span className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground">UX Insights</span>
+                  </div>
+                  <div className="space-y-1 text-[10px] text-muted-foreground">
+                    <p>Avg create job: {uxMetrics.avgCreateMs > 0 ? `${uxMetrics.avgCreateMs}ms` : 'n/a'}</p>
+                    <p>Avg open logs: {uxMetrics.avgOpenLogsMs > 0 ? `${uxMetrics.avgOpenLogsMs}ms` : 'n/a'}</p>
+                    <p>Created: {uxMetrics.jobsCreated} · Run now: {uxMetrics.jobsRun}</p>
+                  </div>
+                </div>
+
                 {/* Disk not available yet */}
                 {system.cpu_count == null && (
                   <div className="flex items-center justify-center py-4 text-muted-foreground" aria-busy="true">
@@ -935,41 +1065,20 @@ export default function App() {
         <button
           onClick={() => setSidebarOpen(o => !o)}
           aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
-          className="shrink-0 w-4 border-r border-border/40 bg-[#eaeae4] hover:bg-[#e0e0d8] flex items-center justify-center text-muted-foreground/60 hover:text-muted-foreground transition-colors"
+          className="shrink-0 w-4 border-r border-border/40 bg-muted/60 hover:bg-muted flex items-center justify-center text-muted-foreground/60 hover:text-muted-foreground transition-colors"
         >
           {sidebarOpen ? <ChevronLeft className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
         </button>
 
         {/* ── Main content area ─────────────────────────────────────────── */}
-        <div className="flex-1 flex flex-col overflow-hidden bg-[#f5f5f2]">
+        <div className="flex-1 flex flex-col overflow-hidden bg-background">
 
           {/* Tab bar */}
-          <div className="shrink-0 border-b border-border/50 bg-white px-4 flex items-center gap-0 h-11">
-            {([
-              ['jobs',    <Clock    key="c" className="h-3.5 w-3.5" />, 'Cron Jobs',    jobs.length],
-              ['scripts', <FileCode2 key="f" className="h-3.5 w-3.5" />, 'Scripts',     scripts.length],
-              ['runs',    <Activity key="a" className="h-3.5 w-3.5" />, 'Run History', runs.length],
-            ] as [Tab, React.ReactNode, string, number][]).map(([id, icon, label, count]) => (
-              <button
-                key={id}
-                onClick={() => setActiveTab(id)}
-                className={`flex items-center gap-1.5 px-4 h-full border-b-2 text-xs font-semibold transition-colors ${
-                  activeTab === id
-                    ? 'border-primary text-primary'
-                    : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-                }`}
-                aria-selected={activeTab === id}
-              >
-                {icon}
-                {label}
-                <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
-                  activeTab === id ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
-                }`}>
-                  {count}
-                </span>
-              </button>
-            ))}
-          </div>
+          <MainTabs
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
+            counts={{ jobs: jobs.length, scripts: scripts.length, runs: runs.length }}
+          />
 
           {/* Tab content */}
           <ScrollArea className="flex-1">
@@ -979,15 +1088,15 @@ export default function App() {
               {/* JOBS TAB                                                  */}
               {/* ══════════════════════════════════════════════════════════ */}
               {activeTab === 'jobs' && (
-                <div>
+                <div role="tabpanel" id="panel-jobs" aria-labelledby="tab-jobs">
                   {/* Section header */}
-                  <div className="flex items-center gap-3 mb-3 flex-wrap">
+                  <div className="sticky top-0 z-10 -mx-5 mb-3 flex items-center gap-3 border-b border-border/40 bg-background/95 px-5 py-2 backdrop-blur flex-wrap">
                     <div>
                       <h1 className="text-[15px] font-bold tracking-tight text-amber-500 uppercase">Scheduled Tasks</h1>
                       <p className="text-[11px] text-muted-foreground">
                         {filteredJobs.length}{jobSearch ? ` of ${jobs.length}` : ''} scheduled task{jobs.length !== 1 ? 's' : ''}
-                        {successCount > 0 && <span className="text-emerald-600 ml-1.5">· {successCount} ok</span>}
-                        {failedCount > 0 && <span className="text-red-500 ml-1">· {failedCount} failed</span>}
+                        {pageSuccessCount > 0 && <span className="text-emerald-600 ml-1.5">· {pageSuccessCount} ok</span>}
+                        {pageFailedCount > 0 && <span className="text-red-500 ml-1">· {pageFailedCount} failed</span>}
                       </p>
                     </div>
                     <div className="flex-1" />
@@ -1029,6 +1138,16 @@ export default function App() {
                       </div>
                       Minimal
                     </label>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => refresh(true)}
+                      disabled={refreshing}
+                      className="h-8 gap-1.5 text-xs"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} aria-hidden="true" />
+                      Refresh
+                    </Button>
                     <Button
                       size="sm"
                       onClick={() => setShowJobForm(f => !f)}
@@ -1073,6 +1192,7 @@ export default function App() {
                             onChange={v => { setNewJob(j => ({ ...j, schedule: v })); if (jobErrors.schedule) setJobErrors(p => ({ ...p, schedule: '' })) }}
                             errors={jobErrors.schedule}
                             presets={presets}
+                            timezone={newJob.timezone}
                           />
                         </div>
                         {/* Row 3: Command */}
@@ -1084,49 +1204,74 @@ export default function App() {
                             aria-invalid={!!jobErrors.command} rows={2} className="font-mono text-xs resize-none" />
                           <FieldError msg={jobErrors.command} id="job-command-error" />
                         </div>
-                        {/* Row 4: Working dir + venv */}
-                        <div className="grid grid-cols-2 gap-3">
-                          <div className="space-y-1">
-                            <Label htmlFor="job-workdir" className="text-xs text-muted-foreground">Working directory <span className="opacity-50">(optional)</span></Label>
-                            <Input id="job-workdir" placeholder="/home/user/myproject" value={newJob.working_directory}
-                              onChange={e => setNewJob(j => ({ ...j, working_directory: e.target.value }))}
-                              className="h-8 font-mono text-xs" />
+                        <button
+                          type="button"
+                          onClick={() => setShowJobAdvanced(v => !v)}
+                          className="flex w-full items-center justify-between rounded-md border border-border/60 bg-muted/20 px-2.5 py-1.5 text-[11px] font-medium text-muted-foreground hover:bg-muted/40"
+                        >
+                          <span>Advanced options (working dir, venv, timeout, logging)</span>
+                          {showJobAdvanced ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                        </button>
+                        {showJobAdvanced && (
+                          <div className="space-y-3 rounded-md border border-border/40 bg-muted/10 p-3">
+                            <div className="space-y-1">
+                              <Label htmlFor="job-timezone" className="text-xs text-muted-foreground">Timezone</Label>
+                              <Select value={newJob.timezone} onValueChange={v => setNewJob(j => ({ ...j, timezone: v }))}>
+                                <SelectTrigger id="job-timezone" className="h-8 text-xs w-52"><SelectValue /></SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="Local">Local (server)</SelectItem>
+                                  <SelectItem value="UTC">UTC</SelectItem>
+                                  <SelectItem value="Asia/Karachi">Asia/Karachi</SelectItem>
+                                  <SelectItem value="Asia/Dubai">Asia/Dubai</SelectItem>
+                                  <SelectItem value="Europe/London">Europe/London</SelectItem>
+                                  <SelectItem value="America/New_York">America/New_York</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                              <div className="space-y-1">
+                                <Label htmlFor="job-workdir" className="text-xs text-muted-foreground">Working directory <span className="opacity-50">(optional)</span></Label>
+                                <Input id="job-workdir" placeholder="/home/user/myproject" value={newJob.working_directory}
+                                  onChange={e => setNewJob(j => ({ ...j, working_directory: e.target.value }))}
+                                  className="h-8 font-mono text-xs" />
+                              </div>
+                              <div className="space-y-1">
+                                <Label htmlFor="job-venv" className="text-xs text-muted-foreground">Python venv <span className="opacity-50">(optional)</span></Label>
+                                <Input id="job-venv" placeholder="/home/user/project/.venv" value={newJob.venv_path}
+                                  onChange={e => setNewJob(j => ({ ...j, venv_path: e.target.value }))}
+                                  className="h-8 font-mono text-xs" />
+                              </div>
+                            </div>
+                            <div className="space-y-1">
+                              <Label htmlFor="job-timeout" className="text-xs text-muted-foreground">
+                                Timeout <span className="opacity-50">(seconds — job is killed after this)</span>
+                              </Label>
+                              <Input id="job-timeout" type="number" min={1} max={86400}
+                                value={newJob.timeout_seconds}
+                                onChange={e => setNewJob(j => ({ ...j, timeout_seconds: Math.max(1, parseInt(e.target.value) || 300) }))}
+                                className="h-8 text-xs w-36" />
+                            </div>
+                            <label className="flex items-center gap-2 cursor-pointer select-none">
+                              <div
+                                role="checkbox"
+                                aria-checked={newJob.logging_enabled}
+                                tabIndex={0}
+                                onClick={() => setNewJob(j => ({ ...j, logging_enabled: !j.logging_enabled }))}
+                                onKeyDown={e => e.key === ' ' && setNewJob(j => ({ ...j, logging_enabled: !j.logging_enabled }))}
+                                className={`relative h-5 w-9 rounded-full transition-colors cursor-pointer ${newJob.logging_enabled ? 'bg-violet-500' : 'bg-muted'}`}
+                              >
+                                <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${newJob.logging_enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                              </div>
+                              <div>
+                                <span className="text-xs font-medium text-foreground">Enable logging</span>
+                                <p className="text-[10px] text-muted-foreground">Capture stdout/stderr for each run</p>
+                              </div>
+                            </label>
                           </div>
-                          <div className="space-y-1">
-                            <Label htmlFor="job-venv" className="text-xs text-muted-foreground">Python venv <span className="opacity-50">(optional)</span></Label>
-                            <Input id="job-venv" placeholder="/home/user/project/.venv" value={newJob.venv_path}
-                              onChange={e => setNewJob(j => ({ ...j, venv_path: e.target.value }))}
-                              className="h-8 font-mono text-xs" />
-                          </div>
-                        </div>
-                        {/* Row 4b: Timeout */}
-                        <div className="space-y-1">
-                          <Label htmlFor="job-timeout" className="text-xs text-muted-foreground">
-                            Timeout <span className="opacity-50">(seconds — job is killed after this)</span>
-                          </Label>
-                          <Input id="job-timeout" type="number" min={1} max={86400}
-                            value={newJob.timeout_seconds}
-                            onChange={e => setNewJob(j => ({ ...j, timeout_seconds: Math.max(1, parseInt(e.target.value) || 300) }))}
-                            className="h-8 text-xs w-36" />
-                        </div>
-                        {/* Row 5: Logging toggle + submit */}
+                        )}
+                        {/* Row 5: Submit */}
                         <div className="flex items-center justify-between pt-1">
-                          <label className="flex items-center gap-2 cursor-pointer select-none">
-                            <div
-                              role="checkbox"
-                              aria-checked={newJob.logging_enabled}
-                              tabIndex={0}
-                              onClick={() => setNewJob(j => ({ ...j, logging_enabled: !j.logging_enabled }))}
-                              onKeyDown={e => e.key === ' ' && setNewJob(j => ({ ...j, logging_enabled: !j.logging_enabled }))}
-                              className={`relative h-5 w-9 rounded-full transition-colors cursor-pointer ${newJob.logging_enabled ? 'bg-violet-500' : 'bg-muted'}`}
-                            >
-                              <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${newJob.logging_enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
-                            </div>
-                            <div>
-                              <span className="text-xs font-medium text-foreground">Enable logging</span>
-                              <p className="text-[10px] text-muted-foreground">Capture stdout/stderr for each run</p>
-                            </div>
-                          </label>
+                          <span className="text-[10px] text-muted-foreground">Advanced options are optional.</span>
                           <Button size="sm" onClick={saveJob} disabled={jobSaving} className="h-8 text-xs gap-1.5">
                             {jobSaving ? <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden="true" /> : <Clock className="h-3.5 w-3.5" aria-hidden="true" />}
                             {jobSaving ? 'Creating…' : 'Create Job'}
@@ -1142,7 +1287,7 @@ export default function App() {
                     <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-border py-12 text-center bg-white">
                       <Clock className="h-8 w-8 text-muted-foreground/30" aria-hidden="true" />
                       <p className="text-sm font-medium text-muted-foreground">No jobs scheduled yet</p>
-                      <p className="text-xs text-muted-foreground/60">Click "New Task" above to create your first job</p>
+                      <p className="text-xs text-muted-foreground/60">Create your first automation with New Task.</p>
                     </div>
                   ) : filteredJobs.length === 0 ? (
                     <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-border py-12 text-center bg-white">
@@ -1159,7 +1304,7 @@ export default function App() {
                             <div className="px-4 py-3 space-y-3" role="region" aria-label={`Edit job ${j.name}`}>
                               <div className="flex items-center justify-between">
                                 <p className="text-xs font-semibold text-foreground">Edit Job</p>
-                                <button onClick={() => setEditingJobId(null)} aria-label="Cancel edit" className="text-muted-foreground hover:text-foreground"><X className="h-3.5 w-3.5" /></button>
+                                <button onClick={() => { setEditingJobId(null); setShowEditAdvanced(false) }} aria-label="Cancel edit" className="text-muted-foreground hover:text-foreground"><X className="h-3.5 w-3.5" /></button>
                               </div>
                               <div className="space-y-3">
                                 {/* Row 1: Name + Comment */}
@@ -1186,6 +1331,7 @@ export default function App() {
                                     onChange={v => { setEditJob(ev => ({ ...ev, schedule: v })); if (editJobErrors.schedule) setEditJobErrors(p => ({ ...p, schedule: '' })) }}
                                     errors={editJobErrors.schedule}
                                     presets={presets}
+                                    timezone={editJob.timezone}
                                   />
                                 </div>
                                 {/* Row 3: Command */}
@@ -1197,48 +1343,73 @@ export default function App() {
                                     aria-invalid={!!editJobErrors.command} rows={2} className="font-mono text-xs resize-none" />
                                   <FieldError msg={editJobErrors.command} id={`edit-cmd-err-${j.id}`} />
                                 </div>
-                                {/* Row 4: Working dir + venv */}
-                                <div className="grid grid-cols-2 gap-3">
-                                  <div className="space-y-1">
-                                    <Label htmlFor={`edit-workdir-${j.id}`} className="text-xs text-muted-foreground">Working directory <span className="opacity-50">(optional)</span></Label>
-                                    <Input id={`edit-workdir-${j.id}`} value={editJob.working_directory} placeholder="/home/user/myproject"
-                                      onChange={e => setEditJob(v => ({ ...v, working_directory: e.target.value }))}
-                                      className="h-8 font-mono text-xs" />
-                                  </div>
-                                  <div className="space-y-1">
-                                    <Label htmlFor={`edit-venv-${j.id}`} className="text-xs text-muted-foreground">Python venv <span className="opacity-50">(optional)</span></Label>
-                                    <Input id={`edit-venv-${j.id}`} value={editJob.venv_path} placeholder="/home/user/project/.venv"
-                                      onChange={e => setEditJob(v => ({ ...v, venv_path: e.target.value }))}
-                                      className="h-8 font-mono text-xs" />
-                                  </div>
-                                </div>
-                                {/* Row 4b: Timeout */}
-                                <div className="space-y-1">
-                                  <Label htmlFor={`edit-timeout-${j.id}`} className="text-xs text-muted-foreground">
-                                    Timeout <span className="opacity-50">(seconds)</span>
-                                  </Label>
-                                  <Input id={`edit-timeout-${j.id}`} type="number" min={1} max={86400}
-                                    value={editJob.timeout_seconds}
-                                    onChange={e => setEditJob(v => ({ ...v, timeout_seconds: Math.max(1, parseInt(e.target.value) || 300) }))}
-                                    className="h-8 text-xs w-36" />
-                                </div>
-                                {/* Row 5: Logging + actions */}
-                                <div className="flex items-center justify-between pt-1">
-                                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                                    <div
-                                      role="checkbox"
-                                      aria-checked={editJob.logging_enabled}
-                                      tabIndex={0}
-                                      onClick={() => setEditJob(v => ({ ...v, logging_enabled: !v.logging_enabled }))}
-                                      onKeyDown={e => e.key === ' ' && setEditJob(v => ({ ...v, logging_enabled: !v.logging_enabled }))}
-                                      className={`relative h-5 w-9 rounded-full transition-colors cursor-pointer ${editJob.logging_enabled ? 'bg-violet-500' : 'bg-muted'}`}
-                                    >
-                                      <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${editJob.logging_enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                                <button
+                                  type="button"
+                                  onClick={() => setShowEditAdvanced(v => !v)}
+                                  className="flex w-full items-center justify-between rounded-md border border-border/60 bg-muted/20 px-2.5 py-1.5 text-[11px] font-medium text-muted-foreground hover:bg-muted/40"
+                                >
+                                  <span>Advanced options (working dir, venv, timeout, logging)</span>
+                                  {showEditAdvanced ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                                </button>
+                                {showEditAdvanced && (
+                                  <div className="space-y-3 rounded-md border border-border/40 bg-muted/10 p-3">
+                                    <div className="space-y-1">
+                                      <Label htmlFor={`edit-timezone-${j.id}`} className="text-xs text-muted-foreground">Timezone</Label>
+                                      <Select value={editJob.timezone} onValueChange={v => setEditJob(ev => ({ ...ev, timezone: v }))}>
+                                        <SelectTrigger id={`edit-timezone-${j.id}`} className="h-8 text-xs w-52"><SelectValue /></SelectTrigger>
+                                        <SelectContent>
+                                          <SelectItem value="Local">Local (server)</SelectItem>
+                                          <SelectItem value="UTC">UTC</SelectItem>
+                                          <SelectItem value="Asia/Karachi">Asia/Karachi</SelectItem>
+                                          <SelectItem value="Asia/Dubai">Asia/Dubai</SelectItem>
+                                          <SelectItem value="Europe/London">Europe/London</SelectItem>
+                                          <SelectItem value="America/New_York">America/New_York</SelectItem>
+                                        </SelectContent>
+                                      </Select>
                                     </div>
-                                    <span className="text-xs font-medium text-foreground">Enable logging</span>
-                                  </label>
+                                    <div className="grid grid-cols-2 gap-3">
+                                      <div className="space-y-1">
+                                        <Label htmlFor={`edit-workdir-${j.id}`} className="text-xs text-muted-foreground">Working directory <span className="opacity-50">(optional)</span></Label>
+                                        <Input id={`edit-workdir-${j.id}`} value={editJob.working_directory} placeholder="/home/user/myproject"
+                                          onChange={e => setEditJob(v => ({ ...v, working_directory: e.target.value }))}
+                                          className="h-8 font-mono text-xs" />
+                                      </div>
+                                      <div className="space-y-1">
+                                        <Label htmlFor={`edit-venv-${j.id}`} className="text-xs text-muted-foreground">Python venv <span className="opacity-50">(optional)</span></Label>
+                                        <Input id={`edit-venv-${j.id}`} value={editJob.venv_path} placeholder="/home/user/project/.venv"
+                                          onChange={e => setEditJob(v => ({ ...v, venv_path: e.target.value }))}
+                                          className="h-8 font-mono text-xs" />
+                                      </div>
+                                    </div>
+                                    <div className="space-y-1">
+                                      <Label htmlFor={`edit-timeout-${j.id}`} className="text-xs text-muted-foreground">
+                                        Timeout <span className="opacity-50">(seconds)</span>
+                                      </Label>
+                                      <Input id={`edit-timeout-${j.id}`} type="number" min={1} max={86400}
+                                        value={editJob.timeout_seconds}
+                                        onChange={e => setEditJob(v => ({ ...v, timeout_seconds: Math.max(1, parseInt(e.target.value) || 300) }))}
+                                        className="h-8 text-xs w-36" />
+                                    </div>
+                                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                                      <div
+                                        role="checkbox"
+                                        aria-checked={editJob.logging_enabled}
+                                        tabIndex={0}
+                                        onClick={() => setEditJob(v => ({ ...v, logging_enabled: !v.logging_enabled }))}
+                                        onKeyDown={e => e.key === ' ' && setEditJob(v => ({ ...v, logging_enabled: !v.logging_enabled }))}
+                                        className={`relative h-5 w-9 rounded-full transition-colors cursor-pointer ${editJob.logging_enabled ? 'bg-violet-500' : 'bg-muted'}`}
+                                      >
+                                        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${editJob.logging_enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                                      </div>
+                                      <span className="text-xs font-medium text-foreground">Enable logging</span>
+                                    </label>
+                                  </div>
+                                )}
+                                {/* Row 5: Actions */}
+                                <div className="flex items-center justify-between pt-1">
+                                  <span className="text-[10px] text-muted-foreground">Advanced options are optional.</span>
                                   <div className="flex gap-2">
-                                    <Button size="sm" variant="outline" onClick={() => setEditingJobId(null)} className="h-8 text-xs">Cancel</Button>
+                                    <Button size="sm" variant="outline" onClick={() => { setEditingJobId(null); setShowEditAdvanced(false) }} className="h-8 text-xs">Cancel</Button>
                                     <Button size="sm" onClick={saveEditJob} disabled={editJobSaving} className="h-8 text-xs gap-1.5">
                                       {editJobSaving ? <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden="true" /> : <Check className="h-3.5 w-3.5" aria-hidden="true" />}
                                       {editJobSaving ? 'Saving…' : 'Save'}
@@ -1295,6 +1466,9 @@ export default function App() {
                                         {j.schedule}
                                       </span>
                                     )}
+                                    <span className="inline-flex items-center gap-1 rounded-sm border border-indigo-200 bg-indigo-50 px-1.5 py-px text-[10px] text-indigo-700">
+                                      TZ {j.timezone || 'Local'}
+                                    </span>
                                     {j.working_directory && (
                                       <span className="inline-flex items-center gap-1 rounded-sm border border-sky-200 bg-sky-50 px-1.5 py-px text-[10px] font-mono text-sky-700 truncate max-w-[180px]" title={j.working_directory}>
                                         📁 {j.working_directory}
@@ -1326,6 +1500,15 @@ export default function App() {
                                         <span className="text-[10px] text-muted-foreground/60">
                                           Last ran {new Date(last.started_at).toLocaleString()}
                                           {last.ended_at && ` · ${runDuration(last)}`}
+                                        </span>
+                                      )
+                                    })()}
+                                    {(() => {
+                                      const nextRun = nextRunByJob[j.id]
+                                      if (!nextRun) return <span className="text-[10px] text-muted-foreground/40">Next run: unknown</span>
+                                      return (
+                                        <span className="inline-flex items-center rounded-sm border border-emerald-200 bg-emerald-50 px-1.5 py-px text-[10px] text-emerald-700">
+                                          Next run in {formatCountdown(nextRun)} · {nextRun.toLocaleString()}
                                         </span>
                                       )
                                     })()}
@@ -1409,7 +1592,7 @@ export default function App() {
               {/* SCRIPTS TAB                                               */}
               {/* ══════════════════════════════════════════════════════════ */}
               {activeTab === 'scripts' && (
-                <div>
+                <div role="tabpanel" id="panel-scripts" aria-labelledby="tab-scripts">
                   <div className="flex items-center gap-3 mb-3">
                     <div>
                       <h1 className="text-[15px] font-bold tracking-tight text-amber-500 uppercase">Scripts</h1>
@@ -1507,26 +1690,37 @@ export default function App() {
               {/* RUNS TAB                                                  */}
               {/* ══════════════════════════════════════════════════════════ */}
               {activeTab === 'runs' && (
-                <div>
+                <div role="tabpanel" id="panel-runs" aria-labelledby="tab-runs">
                   <div className="flex items-center gap-3 mb-3 flex-wrap">
                     <div>
                       <h1 className="text-[15px] font-bold tracking-tight text-amber-500 uppercase">Run History</h1>
                       <p className="text-[11px] text-muted-foreground">
-                        {successCount} succeeded · {failedCount} failed · {runs.length} total
+                        On this page: {pageSuccessCount} succeeded · {pageFailedCount} failed · showing {runs.length} of {runsTotal}
                       </p>
                     </div>
                     <div className="flex-1" />
+                    <div className="relative">
+                      <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground pointer-events-none" aria-hidden="true" />
+                      <input
+                        type="search"
+                        placeholder="Search runs…"
+                        value={runsSearch}
+                        onChange={e => { setRunsSearch(e.target.value); setRunsOffset(0) }}
+                        className="h-8 rounded-md border border-border/60 bg-white pl-7 pr-3 text-xs focus:outline-none focus:ring-1 focus:ring-primary w-36"
+                        aria-label="Search runs"
+                      />
+                    </div>
                     {/* Status filter */}
                     <div className="flex rounded-md border border-border/60 overflow-hidden text-[10px] font-semibold">
                       {([
                         ['all',     'All',     runs.length],
                         ['running', 'Running', runs.filter(r => r.status.toLowerCase() === 'running').length],
-                        ['success', 'Success', successCount],
-                        ['failed',  'Failed',  failedCount],
+                        ['success', 'Success', pageSuccessCount],
+                        ['failed',  'Failed',  pageFailedCount],
                       ] as ['all'|'running'|'success'|'failed', string, number][]).map(([id, label, count]) => (
                         <button
                           key={id}
-                          onClick={() => setRunsFilter(id)}
+                          onClick={() => { setRunsFilter(id); setRunsOffset(0) }}
                           className={`px-2.5 py-1.5 flex items-center gap-1 transition-colors ${runsFilter === id ? 'bg-primary text-white' : 'bg-white text-muted-foreground hover:bg-muted/40'}`}
                         >
                           {label}
@@ -1534,6 +1728,25 @@ export default function App() {
                         </button>
                       ))}
                     </div>
+                    <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={runsCompactMode}
+                        onChange={e => setRunsCompactMode(e.target.checked)}
+                        className="h-3.5 w-3.5"
+                      />
+                      Compact
+                    </label>
+                    <Select value={String(runsPageSize)} onValueChange={(v) => { setRunsPageSize(Number(v)); setRunsOffset(0) }}>
+                      <SelectTrigger className="h-8 w-[108px] text-xs">
+                        <SelectValue placeholder="Page size" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="25">25 / page</SelectItem>
+                        <SelectItem value="50">50 / page</SelectItem>
+                        <SelectItem value="100">100 / page</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
 
                   {runs.length === 0 ? (
@@ -1547,14 +1760,14 @@ export default function App() {
                       {runs.filter(r => {
                         const s = r.status.toLowerCase()
                         if (runsFilter === 'running') return s === 'running'
-                        if (runsFilter === 'success') return ['success','ok','completed'].includes(s)
-                        if (runsFilter === 'failed') return s.includes('fail') || s.includes('error')
+                        if (runsFilter === 'success') return isRunSuccess(s)
+                        if (runsFilter === 'failed') return isRunFailure(s)
                         return true
-                      }).slice(0, 50).map(r => (
+                      }).map(r => (
                         <li key={r.id} className="rounded-lg border border-border/50 bg-white shadow-xs overflow-hidden">
                           {/* Run row — clickable to expand logs */}
                           <button
-                            className={`w-full flex items-center gap-3 px-4 py-3 text-left transition-colors ${selectedRun === r.id ? 'bg-primary/5' : 'hover:bg-muted/30'}`}
+                            className={`w-full flex items-center gap-3 px-4 ${runsCompactMode ? 'py-2' : 'py-3'} text-left transition-colors ${selectedRun === r.id ? 'bg-primary/5' : 'hover:bg-muted/30'}`}
                             onClick={() => setSelectedRun(selectedRun === r.id ? '' : r.id)}
                             aria-expanded={selectedRun === r.id}
                             aria-label={`${r.job_name}, ${r.status}`}
@@ -1584,13 +1797,18 @@ export default function App() {
                                   {r.failure_reason}
                                 </p>
                               )}
+                              {r.failure_fix && (
+                                <span className="mt-1 inline-flex rounded border border-amber-200 bg-amber-50 px-1.5 py-px text-[9px] text-amber-700">
+                                  Suggested fix available
+                                </span>
+                              )}
                             </div>
                             <ChevronRight className={`h-3.5 w-3.5 text-muted-foreground/50 shrink-0 transition-transform ${selectedRun === r.id ? 'rotate-90' : ''}`} aria-hidden="true" />
                           </button>
 
                           {/* Expandable log viewer */}
                           {selectedRun === r.id && (
-                            <div className="border-t border-border/50 px-4 py-3 bg-[#fafaf8]" aria-label="Run logs">
+                            <div className="border-t border-border/50 px-4 py-3 bg-muted/20" aria-label="Run logs">
                               {logsLoading ? (
                                 <div className="flex items-center gap-2 py-2 text-muted-foreground" aria-busy="true">
                                   <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden="true" />
@@ -1625,8 +1843,30 @@ export default function App() {
                       ))}
                     </ul>
                   )}
-                  {runs.length > 50 && runsFilter === 'all' && (
-                    <p className="mt-3 text-center text-[11px] text-muted-foreground">Showing 50 of {runs.length} runs</p>
+                  {runsTotal > 0 && (
+                    <div className="mt-3 flex items-center justify-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-[11px]"
+                      onClick={() => setRunsOffset(o => Math.max(0, o - runsPageSize))}
+                      disabled={runsOffset === 0}
+                    >
+                      Previous
+                    </Button>
+                    <span className="text-[11px] text-muted-foreground">
+                      {runsRangeLabel}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-[11px]"
+                      onClick={() => setRunsOffset(o => o + runsPageSize)}
+                      disabled={!runsHasMore}
+                    >
+                      Next
+                    </Button>
+                    </div>
                   )}
                 </div>
               )}
@@ -1637,8 +1877,19 @@ export default function App() {
       </div>
 
       {logsModalJobId && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-label="Job logs">
-          <div className="w-full max-w-5xl rounded-xl border border-slate-700 bg-[#12131a] text-slate-100 shadow-2xl flex flex-col" style={{ maxHeight: '92vh' }}>
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={logsModalTitleId}
+          aria-describedby={logsModalDescriptionId}
+          onClick={() => { setLogsModalJobId(null); setLogsModalRunId('') }}
+        >
+          <div
+            className="w-full max-w-5xl rounded-xl border border-slate-700 bg-[#12131a] text-slate-100 shadow-2xl flex flex-col"
+            style={{ maxHeight: '92vh' }}
+            onClick={e => e.stopPropagation()}
+          >
 
             {/* ── Terminal title bar ── */}
             <div className="flex items-center gap-2 px-4 py-2.5 bg-[#1c1d28] border-b border-slate-700/80 rounded-t-xl shrink-0">
@@ -1646,7 +1897,7 @@ export default function App() {
               <span className="h-3 w-3 rounded-full bg-amber-400/80" />
               <span className="h-3 w-3 rounded-full bg-emerald-500/80" />
               <div className="flex-1 text-center">
-                <span className="text-[11px] font-mono text-slate-400">
+                <span id={logsModalTitleId} className="text-[11px] font-mono text-slate-400">
                   {modalJob?.name ?? 'Runs'} — terminal
                 </span>
               </div>
@@ -1683,6 +1934,11 @@ export default function App() {
                     <span className="text-[10px] text-slate-500 font-mono">
                       Size: {formatLogSize(modalLogs.stdout, modalLogs.stderr)}
                     </span>
+                    {modalJob && nextRunByJob[modalJob.id] && (
+                      <span className="text-[10px] text-emerald-400 font-mono">
+                        Next run: {formatCountdown(nextRunByJob[modalJob.id] as Date)}
+                      </span>
+                    )}
                   </>
                 )}
               </div>
@@ -1704,11 +1960,15 @@ export default function App() {
                   }}
                   className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-white px-2 py-1 rounded hover:bg-slate-700"
                   title="Copy log to clipboard"
+                  aria-label="Copy current run logs to clipboard"
                 >
                   <Copy className="h-2.5 w-2.5" /> Copy
                 </button>
               </div>
             </div>
+            <p id={logsModalDescriptionId} className="sr-only">
+              Live logs and historical runs for the selected job.
+            </p>
 
             {/* ── Body: run list + terminal ── */}
             <div className="flex flex-1 overflow-hidden min-h-0">
