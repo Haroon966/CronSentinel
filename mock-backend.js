@@ -1,74 +1,134 @@
 #!/usr/bin/env node
 /**
- * CronSentinel mock backend — Node.js, zero dependencies.
- * Implements every API endpoint the frontend calls so the UI is fully functional.
+ * CronSentinel mock backend — Node.js with built-in SQLite (node:sqlite, v22+).
+ * All jobs, scripts and run history are persisted to ./cronsentinel.db.
  * Run:  node mock-backend.js
  */
 
-const http = require('http')
-const os = require('os')
-const { execSync } = require('child_process')
-const { randomUUID } = require('crypto')
-const PORT = 8080
+// Suppress the experimental SQLite warning
+process.removeAllListeners('warning')
 
-// ── In-memory stores ────────────────────────────────────────────────────────
+const http      = require('http')
+const os        = require('os')
+const path      = require('path')
+const { execSync, spawn } = require('child_process')
+const { randomUUID }      = require('crypto')
+const readline  = require('readline')
+const { DatabaseSync }    = require('node:sqlite')
 
-let scripts = [
-  { name: 'health-check', content: '#!/usr/bin/env bash\ncurl -sf http://localhost:8080/healthz', created_at: new Date().toISOString() },
-  { name: 'cleanup-logs', content: '#!/usr/bin/env bash\nfind /tmp -name "*.log" -mtime +7 -delete', created_at: new Date().toISOString() },
-]
+const PORT   = 8080
+const DB_PATH = path.join(__dirname, 'cronsentinel.db')
 
-let jobs = [
-  {
-    id: randomUUID(), name: 'Health Check', schedule: '*/5 * * * *',
-    working_directory: '', command: 'echo "health ok"',
-    comment: 'Runs every 5 minutes', logging_enabled: true, timeout_seconds: 30,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: randomUUID(), name: 'Daily Backup', schedule: '0 2 * * *',
-    working_directory: '', command: 'echo "backup complete"',
-    comment: 'Runs at 2 AM daily', logging_enabled: true, timeout_seconds: 300,
-    created_at: new Date().toISOString(),
-  },
-]
+// ── Database setup ───────────────────────────────────────────────────────────
 
-let runs = [
-  {
-    id: randomUUID(), job_id: jobs[0].id, job_name: 'Health Check',
-    command: 'echo "health ok"', status: 'success', exit_code: 0,
-    stdout: 'health ok\n', stderr: '',
-    started_at: new Date(Date.now() - 60000).toISOString(),
-    ended_at: new Date(Date.now() - 59000).toISOString(),
-    failure_reason: '', failure_fix: '',
-  },
-  {
-    id: randomUUID(), job_id: jobs[1].id, job_name: 'Daily Backup',
-    command: 'echo "backup complete"', status: 'success', exit_code: 0,
-    stdout: 'backup complete\n', stderr: '',
-    started_at: new Date(Date.now() - 3600000).toISOString(),
-    ended_at: new Date(Date.now() - 3599000).toISOString(),
-    failure_reason: '', failure_fix: '',
-  },
-  {
-    id: randomUUID(), job_id: jobs[0].id, job_name: 'Health Check',
-    command: 'echo "health ok"', status: 'failure', exit_code: 1,
-    stdout: '', stderr: 'command not found: eccho\n',
-    started_at: new Date(Date.now() - 120000).toISOString(),
-    ended_at: new Date(Date.now() - 119000).toISOString(),
-    failure_reason: 'Command not found',
-    failure_fix: 'Install the missing command or add it to PATH in the script',
-  },
-]
+const db = new DatabaseSync(DB_PATH)
 
-// SSE subscribers: runId -> [res, ...]
-const subscribers = {}
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+  CREATE TABLE IF NOT EXISTS scripts (
+    name        TEXT PRIMARY KEY,
+    content     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS jobs (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    schedule            TEXT NOT NULL,
+    command             TEXT NOT NULL,
+    working_directory   TEXT NOT NULL DEFAULT '',
+    venv_path           TEXT NOT NULL DEFAULT '',
+    comment             TEXT NOT NULL DEFAULT '',
+    logging_enabled     INTEGER NOT NULL DEFAULT 1,
+    timeout_seconds     INTEGER NOT NULL DEFAULT 300,
+    created_at          TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS runs (
+    id              TEXT PRIMARY KEY,
+    job_id          TEXT,
+    job_name        TEXT NOT NULL,
+    command         TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'running',
+    exit_code       INTEGER,
+    stdout          TEXT NOT NULL DEFAULT '',
+    stderr          TEXT NOT NULL DEFAULT '',
+    started_at      TEXT NOT NULL,
+    ended_at        TEXT,
+    failure_reason  TEXT NOT NULL DEFAULT '',
+    failure_fix     TEXT NOT NULL DEFAULT ''
+  );
+`)
+
+// Seed default data on first run (empty DB)
+const jobCount = db.prepare('SELECT COUNT(*) AS n FROM jobs').get()
+if (jobCount.n === 0) {
+  const id1 = randomUUID()
+  const id2 = randomUUID()
+  const now  = new Date().toISOString()
+
+  db.prepare(`INSERT INTO jobs (id,name,schedule,command,comment,logging_enabled,timeout_seconds,created_at)
+              VALUES (?,?,?,?,?,1,30,?)`).run(id1, 'Health Check',  '*/5 * * * *', 'echo "health ok"',    'Runs every 5 minutes', now)
+  db.prepare(`INSERT INTO jobs (id,name,schedule,command,comment,logging_enabled,timeout_seconds,created_at)
+              VALUES (?,?,?,?,?,1,300,?)`).run(id2, 'Daily Backup', '0 2 * * *',   'echo "backup complete"', 'Runs at 2 AM daily',   now)
+
+  const r1 = randomUUID(), r2 = randomUUID(), r3 = randomUUID()
+  const t  = Date.now()
+  db.prepare(`INSERT INTO runs (id,job_id,job_name,command,status,exit_code,stdout,stderr,started_at,ended_at,failure_reason,failure_fix)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    r1, id1, 'Health Check', 'echo "health ok"', 'success', 0,
+    'health ok\n', '', new Date(t - 60000).toISOString(), new Date(t - 59000).toISOString(), '', '')
+  db.prepare(`INSERT INTO runs (id,job_id,job_name,command,status,exit_code,stdout,stderr,started_at,ended_at,failure_reason,failure_fix)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    r2, id2, 'Daily Backup', 'echo "backup complete"', 'success', 0,
+    'backup complete\n', '', new Date(t - 3600000).toISOString(), new Date(t - 3599000).toISOString(), '', '')
+  db.prepare(`INSERT INTO runs (id,job_id,job_name,command,status,exit_code,stdout,stderr,started_at,ended_at,failure_reason,failure_fix)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    r3, id1, 'Health Check', 'echo "health ok"', 'failure', 1,
+    '', 'command not found: eccho\n', new Date(t - 120000).toISOString(), new Date(t - 119000).toISOString(),
+    'Command not found', 'Install the missing command or add it to PATH')
+
+  db.prepare(`INSERT INTO scripts (name,content,created_at) VALUES (?,?,?)`).run(
+    'health-check', '#!/usr/bin/env bash\ncurl -sf http://localhost:8080/healthz', now)
+  db.prepare(`INSERT INTO scripts (name,content,created_at) VALUES (?,?,?)`).run(
+    'cleanup-logs', '#!/usr/bin/env bash\nfind /tmp -name "*.log" -mtime +7 -delete', now)
+}
+
+// ── Prepared statements ──────────────────────────────────────────────────────
+
+const stmts = {
+  allJobs:       db.prepare('SELECT * FROM jobs ORDER BY created_at DESC'),
+  jobById:       db.prepare('SELECT * FROM jobs WHERE id = ?'),
+  insertJob:     db.prepare(`INSERT INTO jobs (id,name,schedule,command,working_directory,venv_path,comment,logging_enabled,timeout_seconds,created_at)
+                              VALUES (?,?,?,?,?,?,?,?,?,?)`),
+  updateJob:     db.prepare(`UPDATE jobs SET name=?,schedule=?,command=?,working_directory=?,venv_path=?,comment=?,logging_enabled=?,timeout_seconds=? WHERE id=?`),
+  deleteJob:     db.prepare('DELETE FROM jobs WHERE id = ?'),
+
+  allScripts:    db.prepare('SELECT * FROM scripts ORDER BY created_at DESC'),
+  upsertScript:  db.prepare(`INSERT INTO scripts (name,content,created_at) VALUES (?,?,?)
+                              ON CONFLICT(name) DO UPDATE SET content=excluded.content`),
+  deleteScript:  db.prepare('DELETE FROM scripts WHERE name = ?'),
+
+  allRuns:       db.prepare('SELECT * FROM runs ORDER BY started_at DESC LIMIT 100'),
+  runById:       db.prepare('SELECT * FROM runs WHERE id = ?'),
+  insertRun:     db.prepare(`INSERT INTO runs (id,job_id,job_name,command,status,exit_code,stdout,stderr,started_at,ended_at,failure_reason,failure_fix)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
+  updateRunStatus: db.prepare(`UPDATE runs SET status=?,exit_code=?,stdout=?,stderr=?,ended_at=?,failure_reason=?,failure_fix=? WHERE id=?`),
+  appendStdout:  db.prepare(`UPDATE runs SET stdout = stdout || ? WHERE id = ?`),
+  appendStderr:  db.prepare(`UPDATE runs SET stderr = stderr || ? WHERE id = ?`),
+}
+
+// ── SSE subscribers (in-memory — transient connections) ──────────────────────
+
+const subscribers = {}   // runId -> [res, ...]
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS')
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
 }
 
@@ -97,201 +157,273 @@ function publish(runId, msg) {
   }
 }
 
+function rowToJob(r) {
+  return { ...r, logging_enabled: r.logging_enabled === 1 }
+}
+
 function getDiskStats() {
   try {
-    // POSIX output: Filesystem 1024-blocks Used Available Capacity Mounted on
     const output = execSync('df -P -k /', { encoding: 'utf8' })
-    const lines = output.trim().split('\n')
+    const lines  = output.trim().split('\n')
     if (lines.length < 2) return []
-    const parts = lines[1].trim().split(/\s+/)
-    // Expected columns; tolerate slight platform differences.
+    const parts      = lines[1].trim().split(/\s+/)
     const mountpoint = parts[parts.length - 1] || '/'
-    const usedPctRaw = parts[4] || '0%'
-    const usedPercent = Number.parseFloat(String(usedPctRaw).replace('%', ''))
+    const usedPercent = Number.parseFloat(String(parts[4] || '0').replace('%', ''))
     return [{ path: mountpoint, used_percent: Number.isFinite(usedPercent) ? usedPercent : 0 }]
-  } catch {
-    return []
-  }
+  } catch { return [] }
 }
 
-function simulateRun(runId, command) {
-  const lines = [
-    `$ ${command}`,
-    'Starting execution…',
-    'Processing…',
-    Math.random() > 0.2 ? 'Done.' : 'Error: simulated failure',
-  ]
-  let i = 0
-  const iv = setInterval(() => {
-    if (i < lines.length) {
-      publish(runId, { status: 'running', stream: 'stdout', line: lines[i++] })
-    } else {
-      clearInterval(iv)
-      const success = Math.random() > 0.15
-      const run = runs.find(r => r.id === runId)
-      if (run) {
-        run.status = success ? 'success' : 'failure'
-        run.exit_code = success ? 0 : 1
-        run.stdout = lines.join('\n') + '\n'
-        run.ended_at = new Date().toISOString()
-        if (!success) {
-          run.failure_reason = 'Non-zero exit code'
-          run.failure_fix = 'Inspect stderr logs and add validation or guard clauses'
-        }
-      }
-      publish(runId, { status: run?.status ?? 'success', stdout: run?.stdout ?? '', stderr: '' })
-      delete subscribers[runId]
+function diagnoseFailure(stderr, timedOut) {
+  if (timedOut) return { failure_reason: 'Execution timed out', failure_fix: 'Increase timeout_seconds or optimise the script runtime' }
+  const lower = String(stderr || '').toLowerCase()
+  if (lower.includes('permission denied')) return { failure_reason: 'Permission denied', failure_fix: 'Ensure the script/executable has correct permissions and user access' }
+  if (lower.includes('command not found'))  return { failure_reason: 'Command not found',  failure_fix: 'Install the missing command or add it to PATH' }
+  if (lower.includes('no such file'))       return { failure_reason: 'File not found',      failure_fix: 'Check command path and working_directory' }
+  return { failure_reason: 'Non-zero exit code', failure_fix: 'Inspect stderr logs and add validation or guard clauses' }
+}
+
+// ── Job runner ───────────────────────────────────────────────────────────────
+
+function executeRun(runId, job) {
+  const run = stmts.runById.get(runId)
+  if (!run) return
+
+  const cwd = job.working_directory && String(job.working_directory).trim()
+    ? String(job.working_directory).trim()
+    : process.cwd()
+
+  const venvPath      = job.venv_path && String(job.venv_path).trim()
+  const activateSnippet = venvPath ? `source "${venvPath}/bin/activate" && ` : ''
+  const fullCommand   = `${activateSnippet}${job.command}`
+
+  const displayLine   = venvPath ? `(venv: ${venvPath}) $ ${job.command}` : `$ ${job.command}`
+  stmts.appendStdout.run(`${displayLine}\n`, runId)
+  publish(runId, { status: 'running', stream: 'stdout', line: displayLine })
+
+  const child = spawn('bash', ['-lc', fullCommand], {
+    cwd,
+    env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONDONTWRITEBYTECODE: '1' },
+  })
+
+  const timeoutMs = Math.max(1, Number(job.timeout_seconds || 300)) * 1000
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    try { child.kill('SIGTERM') } catch (_) {}
+    setTimeout(() => { try { child.kill('SIGKILL') } catch (_) {} }, 3000)
+  }, timeoutMs)
+
+  const outReader = readline.createInterface({ input: child.stdout })
+  const errReader = readline.createInterface({ input: child.stderr })
+
+  outReader.on('line', (line) => {
+    stmts.appendStdout.run(`${line}\n`, runId)
+    publish(runId, { status: 'running', stream: 'stdout', line })
+  })
+
+  errReader.on('line', (line) => {
+    stmts.appendStderr.run(`${line}\n`, runId)
+    publish(runId, { status: 'running', stream: 'stderr', line })
+  })
+
+  child.on('error', (err) => {
+    clearTimeout(timeout)
+    stmts.appendStderr.run(`${err.message}\n`, runId)
+    const d = diagnoseFailure(err.message, false)
+    const finalRun = stmts.runById.get(runId)
+    stmts.updateRunStatus.run('failure', 1, finalRun.stdout, finalRun.stderr, new Date().toISOString(), d.failure_reason, d.failure_fix, runId)
+    const saved = stmts.runById.get(runId)
+    publish(runId, { status: 'failure', stdout: saved.stdout, stderr: saved.stderr, exit_code: 1 })
+    delete subscribers[runId]
+  })
+
+  child.on('close', (code) => {
+    clearTimeout(timeout)
+    const exitCode = Number.isInteger(code) ? code : 1
+    const status   = exitCode === 0 && !timedOut ? 'success' : 'failure'
+    const finalRun = stmts.runById.get(runId)
+    let fr = '', ff = ''
+    if (status === 'failure') {
+      const d = diagnoseFailure(finalRun.stderr, timedOut)
+      fr = d.failure_reason; ff = d.failure_fix
     }
-  }, 400)
+    stmts.updateRunStatus.run(status, exitCode, finalRun.stdout, finalRun.stderr, new Date().toISOString(), fr, ff, runId)
+    const saved = stmts.runById.get(runId)
+    publish(runId, { status, stdout: saved.stdout, stderr: saved.stderr, exit_code: exitCode })
+    delete subscribers[runId]
+  })
 }
 
-// ── Router ──────────────────────────────────────────────────────────────────
+// ── HTTP router ──────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`)
-  const path = url.pathname
+  const url    = new URL(req.url, `http://localhost:${PORT}`)
+  const path_  = url.pathname
   const method = req.method
 
-  // Preflight
   if (method === 'OPTIONS') { cors(res); res.writeHead(204); res.end(); return }
 
-  console.log(`${method} ${path}`)
+  console.log(`${method} ${path_}`)
 
-  // ── Health ──────────────────────────────────────────────────────────────
-  if (method === 'GET' && path === '/healthz') {
+  // ── Health ────────────────────────────────────────────────────────────────
+  if (method === 'GET' && path_ === '/healthz') {
     return json(res, 200, { ok: true })
   }
 
-  // ── System info ─────────────────────────────────────────────────────────
-  if (method === 'GET' && path === '/api/system') {
-    const totalMem = os.totalmem()
-    const freeMem = os.freemem()
-    const usedMem = totalMem - freeMem
+  // ── System info ───────────────────────────────────────────────────────────
+  if (method === 'GET' && path_ === '/api/system') {
+    const totalMem = os.totalmem(), freeMem = os.freemem(), usedMem = totalMem - freeMem
     const load = os.loadavg()
     return json(res, 200, {
       uptime_seconds: Math.floor(os.uptime()),
-      cpu_count: os.cpus().length,
-      memory: {
-        total: totalMem,
-        used: usedMem,
-        usedPercent: totalMem > 0 ? (usedMem / totalMem) * 100 : 0,
-      },
-      load: { load1: load[0] ?? 0, load5: load[1] ?? 0, load15: load[2] ?? 0 },
-      disks: getDiskStats(),
-      gpu: 'unavailable in node mock backend',
+      cpu_count:      os.cpus().length,
+      memory: { total: totalMem, used: usedMem, usedPercent: totalMem > 0 ? (usedMem / totalMem) * 100 : 0 },
+      load:   { load1: load[0] ?? 0, load5: load[1] ?? 0, load15: load[2] ?? 0 },
+      disks:  getDiskStats(),
     })
   }
 
-  // ── Scripts ─────────────────────────────────────────────────────────────
-  if (method === 'GET' && path === '/api/scripts') {
-    return json(res, 200, scripts)
+  // ── Scripts ───────────────────────────────────────────────────────────────
+  if (method === 'GET' && path_ === '/api/scripts') {
+    return json(res, 200, stmts.allScripts.all())
   }
 
-  if (method === 'POST' && path === '/api/scripts') {
+  if (method === 'POST' && path_ === '/api/scripts') {
     let body
     try { body = await readBody(req) } catch { return json(res, 400, { error: 'invalid JSON' }) }
-    const name = (body.name || '').trim()
+    const name    = (body.name    || '').trim()
     const content = (body.content || '').trim()
-    if (!name) return json(res, 400, { error: 'script name is required' })
+    if (!name)    return json(res, 400, { error: 'script name is required' })
     if (!/^[a-zA-Z0-9._-]+$/.test(name)) return json(res, 400, { error: 'script name must only contain letters, digits, dots, hyphens, or underscores' })
     if (!content) return json(res, 400, { error: 'script content is required' })
-    const idx = scripts.findIndex(s => s.name === name)
-    if (idx >= 0) scripts[idx] = { name, content, created_at: scripts[idx].created_at }
-    else scripts.unshift({ name, content, created_at: new Date().toISOString() })
+    stmts.upsertScript.run(name, content, new Date().toISOString())
     return json(res, 201, { ok: true })
   }
 
-  const scriptDeleteMatch = path.match(/^\/api\/scripts\/(.+)$/)
+  const scriptDeleteMatch = path_.match(/^\/api\/scripts\/(.+)$/)
   if (method === 'DELETE' && scriptDeleteMatch) {
     const name = decodeURIComponent(scriptDeleteMatch[1])
-    scripts = scripts.filter(s => s.name !== name)
+    stmts.deleteScript.run(name)
     return json(res, 200, { ok: true })
   }
 
-  // ── Jobs ────────────────────────────────────────────────────────────────
-  if (method === 'GET' && path === '/api/jobs') {
-    return json(res, 200, jobs)
+  // ── Jobs ──────────────────────────────────────────────────────────────────
+  if (method === 'GET' && path_ === '/api/jobs') {
+    return json(res, 200, stmts.allJobs.all().map(rowToJob))
   }
 
-  if (method === 'GET' && path === '/api/jobs/presets') {
+  if (method === 'GET' && path_ === '/api/jobs/presets') {
     return json(res, 200, [
-      { label: 'Every minute',        schedule: '* * * * *'   },
-      { label: 'Every 5 minutes',     schedule: '*/5 * * * *' },
-      { label: 'Hourly',              schedule: '0 * * * *'   },
-      { label: 'Daily at midnight',   schedule: '0 0 * * *'   },
-      { label: 'Weekly (Sun midnight)', schedule: '0 0 * * 0' },
+      { label: 'Every minute',          schedule: '* * * * *'    },
+      { label: 'Every 5 minutes',       schedule: '*/5 * * * *'  },
+      { label: 'Hourly',                schedule: '0 * * * *'    },
+      { label: 'Daily at midnight',     schedule: '0 0 * * *'    },
+      { label: 'Weekly (Sun midnight)', schedule: '0 0 * * 0'    },
     ])
   }
 
-  if (method === 'POST' && path === '/api/jobs') {
+  if (method === 'POST' && path_ === '/api/jobs') {
     let body
     try { body = await readBody(req) } catch { return json(res, 400, { error: 'invalid JSON' }) }
-    const name = (body.name || '').trim()
-    const command = (body.command || '').trim()
+    const name     = (body.name     || '').trim()
+    const command  = (body.command  || '').trim()
     const schedule = (body.schedule || '').trim()
-    if (!name) return json(res, 400, { error: 'job name is required' })
+    if (!name)    return json(res, 400, { error: 'job name is required' })
     if (!command) return json(res, 400, { error: 'command is required' })
     if ((schedule.match(/\S+/g) || []).length !== 5) return json(res, 400, { error: 'invalid cron schedule — must be exactly 5 space-separated fields' })
-    jobs.unshift({
-      id: randomUUID(), name, schedule,
-      working_directory: body.working_directory || '',
-      command, comment: body.comment || '',
-      logging_enabled: body.logging_enabled !== false,
-      timeout_seconds: body.timeout_seconds > 0 ? body.timeout_seconds : 300,
-      created_at: new Date().toISOString(),
-    })
+    stmts.insertJob.run(
+      randomUUID(), name, schedule,
+      command,
+      body.working_directory || '',
+      body.venv_path || '',
+      body.comment   || '',
+      body.logging_enabled !== false ? 1 : 0,
+      body.timeout_seconds > 0 ? body.timeout_seconds : 300,
+      new Date().toISOString(),
+    )
     return json(res, 201, { ok: true })
   }
 
-  const jobMatch = path.match(/^\/api\/jobs\/([^/]+)$/)
-  if (method === 'DELETE' && jobMatch) {
-    const id = decodeURIComponent(jobMatch[1])
-    const before = jobs.length
-    jobs = jobs.filter(j => j.id !== id)
-    if (jobs.length === before) return json(res, 404, { error: 'job not found' })
+  const jobMatch = path_.match(/^\/api\/jobs\/([^/]+)$/)
+  if (method === 'PUT' && jobMatch) {
+    const id  = decodeURIComponent(jobMatch[1])
+    const job = stmts.jobById.get(id)
+    if (!job) return json(res, 404, { error: 'job not found' })
+    let body
+    try { body = await readBody(req) } catch { return json(res, 400, { error: 'invalid JSON' }) }
+    const name     = (body.name     || '').trim()
+    const command  = (body.command  || '').trim()
+    const schedule = (body.schedule || '').trim()
+    if (!name)    return json(res, 400, { error: 'job name is required' })
+    if (!command) return json(res, 400, { error: 'command is required' })
+    if ((schedule.match(/\S+/g) || []).length !== 5) return json(res, 400, { error: 'invalid cron schedule — must be exactly 5 space-separated fields' })
+    stmts.updateJob.run(
+      name, schedule, command,
+      body.working_directory || '',
+      body.venv_path  || '',
+      body.comment    || '',
+      body.logging_enabled !== false ? 1 : 0,
+      body.timeout_seconds > 0 ? body.timeout_seconds : 300,
+      id,
+    )
     return json(res, 200, { ok: true })
   }
 
-  const runJobMatch = path.match(/^\/api\/jobs\/([^/]+)\/run$/)
+  if (method === 'DELETE' && jobMatch) {
+    const id  = decodeURIComponent(jobMatch[1])
+    const job = stmts.jobById.get(id)
+    if (!job) return json(res, 404, { error: 'job not found' })
+    stmts.deleteJob.run(id)
+    return json(res, 200, { ok: true })
+  }
+
+  // ── Run a job now ─────────────────────────────────────────────────────────
+  const runJobMatch = path_.match(/^\/api\/jobs\/([^/]+)\/run$/)
   if (method === 'POST' && runJobMatch) {
-    const id = decodeURIComponent(runJobMatch[1])
-    const job = jobs.find(j => j.id === id)
+    const id  = decodeURIComponent(runJobMatch[1])
+    const job = stmts.jobById.get(id)
     if (!job) return json(res, 404, { error: 'job not found' })
     const runId = randomUUID()
-    const run = {
-      id: runId, job_id: job.id, job_name: job.name,
-      command: job.command, status: 'running', exit_code: null,
-      stdout: '', stderr: '',
-      started_at: new Date().toISOString(), ended_at: null,
-      failure_reason: '', failure_fix: '',
-    }
-    runs.unshift(run)
-    setTimeout(() => simulateRun(runId, job.command), 50)
+    stmts.insertRun.run(
+      runId, job.id, job.name, job.command,
+      'running', null, '', '',
+      new Date().toISOString(), null, '', '',
+    )
+    setTimeout(() => executeRun(runId, rowToJob(job)), 10)
     return json(res, 202, { status: 'started_in_background', run_id: runId })
   }
 
-  // ── Runs ────────────────────────────────────────────────────────────────
-  if (method === 'GET' && path === '/api/runs') {
-    return json(res, 200, runs.slice(0, 100))
+  // ── Runs ──────────────────────────────────────────────────────────────────
+  if (method === 'GET' && path_ === '/api/runs') {
+    return json(res, 200, stmts.allRuns.all())
   }
 
-  const logsMatch = path.match(/^\/api\/runs\/([^/]+)\/logs$/)
+  const logsMatch = path_.match(/^\/api\/runs\/([^/]+)\/logs$/)
   if (method === 'GET' && logsMatch) {
-    const run = runs.find(r => r.id === logsMatch[1])
+    const run = stmts.runById.get(logsMatch[1])
     if (!run) return json(res, 404, { error: 'run not found' })
     return json(res, 200, { stdout: run.stdout, stderr: run.stderr })
   }
 
-  const streamMatch = path.match(/^\/api\/runs\/([^/]+)\/stream$/)
+  const streamMatch = path_.match(/^\/api\/runs\/([^/]+)\/stream$/)
   if (method === 'GET' && streamMatch) {
     const runId = streamMatch[1]
+    const run   = stmts.runById.get(runId)
     cors(res)
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
+      'Connection':    'keep-alive',
     })
     res.write(': connected\n\n')
+
+    // If run already finished, replay final state immediately and close
+    if (run && run.status !== 'running') {
+      res.write(`data: ${JSON.stringify({ status: run.status, stdout: run.stdout, stderr: run.stderr, exit_code: run.exit_code })}\n\n`)
+      res.end()
+      return
+    }
+
     if (!subscribers[runId]) subscribers[runId] = []
     subscribers[runId].push(res)
     req.on('close', () => {
@@ -304,6 +436,6 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.listen(PORT, () => {
-  console.log(`\n  CronSentinel mock backend running`)
+  console.log(`\n  CronSentinel backend running  (SQLite: ${DB_PATH})`)
   console.log(`  http://localhost:${PORT}/healthz\n`)
 })

@@ -516,7 +516,7 @@ func (a *app) markRunFailed(runID uuid.UUID, reason, fix string) {
 
 func (a *app) listRuns(c *gin.Context) {
 	rows, err := a.db.Query(c,
-		"select id,job_id,job_name,status,exit_code,started_at,ended_at,failure_reason,failure_fix from job_runs order by started_at desc limit 100")
+		"select id,job_id,job_name,command,status,exit_code,started_at,ended_at,failure_reason,failure_fix from job_runs order by started_at desc limit 100")
 	if err != nil {
 		slog.Error("listRuns query", "err", err)
 		c.JSON(500, gin.H{"error": "failed to query runs"})
@@ -528,17 +528,17 @@ func (a *app) listRuns(c *gin.Context) {
 	for rows.Next() {
 		var id uuid.UUID
 		var jobID *uuid.UUID
-		var name, status, reason, fix string
+		var name, command, status, reason, fix string
 		var exitCode *int
 		var started time.Time
 		var ended *time.Time
-		if err := rows.Scan(&id, &jobID, &name, &status, &exitCode, &started, &ended, &reason, &fix); err != nil {
+		if err := rows.Scan(&id, &jobID, &name, &command, &status, &exitCode, &started, &ended, &reason, &fix); err != nil {
 			slog.Error("listRuns scan", "err", err)
 			c.JSON(500, gin.H{"error": "failed to read run row"})
 			return
 		}
 		out = append(out, gin.H{
-			"id": id, "job_id": jobID, "job_name": name, "status": status,
+			"id": id, "job_id": jobID, "job_name": name, "command": command, "status": status,
 			"exit_code": exitCode, "started_at": started, "ended_at": ended,
 			"failure_reason": reason, "failure_fix": fix,
 		})
