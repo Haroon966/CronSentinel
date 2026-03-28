@@ -23,6 +23,8 @@ services:
       PORT: 8080
       SCRIPT_DIR: /data/scripts
       DATABASE_URL: postgres://postgres:postgres@db:5432/cronsentinel?sslmode=disable
+      # Optional: override SMTP password from Settings (Docker secret / env file)
+      # NOTIFICATION_SMTP_PASSWORD: ""
     depends_on:
       db:
         condition: service_healthy
@@ -36,7 +38,10 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     environment:
+      # Browser talks to localhost:8080; leave unset in dev to use Vite proxy + CRONSENTINEL_DEV_API_PROXY
       VITE_API_BASE_URL: http://localhost:8080
+      # Vite dev server (in this container) proxies /api to the backend service
+      CRONSENTINEL_DEV_API_PROXY: http://backend:8080
     depends_on:
       - backend
     ports:

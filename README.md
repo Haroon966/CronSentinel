@@ -189,7 +189,7 @@ node mock-backend.js
 cd frontend && npm install && npm run dev
 ```
 
-The mock runs on port `8080` and simulates every API endpoint with realistic in-memory data.
+The mock runs on port `8080` and simulates API endpoints (including notification settings and run-history email stubs) with a local SQLite database.
 
 ---
 
@@ -203,6 +203,7 @@ The mock runs on port `8080` and simulates every API endpoint with realistic in-
 | `PORT` | `8080` | HTTP port |
 | `DATABASE_URL` | `postgres://postgres:postgres@db:5432/cronsentinel?sslmode=disable` | PostgreSQL DSN |
 | `SCRIPT_DIR` | `/data/scripts` | Where scripts are stored on disk |
+| `NOTIFICATION_SMTP_PASSWORD` | _(empty)_ | If set, overrides the SMTP password stored in **Settings** (useful for Docker secrets without persisting the password in Postgres) |
 
 </details>
 
@@ -211,7 +212,8 @@ The mock runs on port `8080` and simulates every API endpoint with realistic in-
 
 | Variable | Default | Description |
 |:---|:---|:---|
-| `VITE_API_BASE_URL` | `http://localhost:8080` | Backend API base URL |
+| `VITE_API_BASE_URL` | `http://localhost:8080` | Backend API base URL. If you set this to an **empty** value by mistake, the browser will call `/api/...` on the Vite dev server and get **404** — either set a full URL or omit the variable. |
+| `CRONSENTINEL_DEV_API_PROXY` | _(vite only)_ | Used by `vite.config.ts` to proxy `/api` and `/healthz`. In Docker dev, Compose sets this to `http://backend:8080` so the frontend container can reach the API. |
 
 </details>
 
@@ -221,15 +223,26 @@ The mock runs on port `8080` and simulates every API endpoint with realistic in-
 
 ### Dashboard
 
-Three tabs are available at all times:
+Four tabs are available at all times:
 
 | Tab | What it does |
 |:---|:---|
 | **Jobs** | Create, manage, and manually trigger cron jobs |
 | **Scripts** | Write and store reusable shell scripts |
-| **Runs** | Browse the full execution history |
+| **Runs** | Browse the full execution history; **Email history** sends up to 500 newest runs matching the current filters |
+| **Settings** | Configure SMTP and when to email (scheduled vs manual, success vs failure) |
 
 The header shows live system stats: **CPU cores · Memory · Disk · Load averages**.
+
+### Email notifications
+
+1. Open **Settings** and enable notifications.
+2. Enter SMTP host, port, username (if required), **From**, and comma-separated **To** addresses. For port **587**, leave **STARTTLS** on; port **465** uses implicit TLS automatically.
+3. Choose which events trigger mail (e.g. scheduled failure only, or all outcomes).
+4. Use **Send test email** to verify delivery.
+5. On **Run History**, use **Email history** to receive a plain-text summary of runs matching the current status filter and search (capped at 500 rows).
+
+Until notifications are enabled and SMTP is valid, run alerts and history email are skipped.
 
 ---
 

@@ -1,12 +1,9 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
-# Copy manifest first; go mod download creates go.sum inside the container.
-# For better layer caching: run `go mod tidy`, commit go.sum, then change the
-# line below to `COPY go.mod go.sum ./`.
-COPY go.mod ./
-RUN go mod download
+# Without a committed go.sum, `go build` fails. Tidy generates go.sum before build.
+# Optional: commit go.sum and split COPY go.mod go.sum + go mod download for better caching.
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/server ./cmd/server
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o /out/server ./cmd/server
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates bash

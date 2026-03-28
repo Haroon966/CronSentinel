@@ -4,20 +4,22 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"cronsentinel/internal/heartbeat"
 )
 
 func TestCronMatch(t *testing.T) {
 	now := time.Date(2026, 1, 5, 10, 30, 0, 0, time.UTC)
-	if !matchesCron("* * * * *", now) {
+	if !heartbeat.MatchesCron("* * * * *", now) {
 		t.Fatal("wildcard cron should match")
 	}
-	if !matchesCron("30 10 * * *", now) {
+	if !heartbeat.MatchesCron("30 10 * * *", now) {
 		t.Fatal("exact cron should match")
 	}
-	if matchesCron("31 10 * * *", now) {
+	if heartbeat.MatchesCron("31 10 * * *", now) {
 		t.Fatal("non-matching minute should fail")
 	}
-	if !matchesCron("*/5 * * * *", time.Date(2026, 1, 5, 10, 35, 0, 0, time.UTC)) {
+	if !heartbeat.MatchesCron("*/5 * * * *", time.Date(2026, 1, 5, 10, 35, 0, 0, time.UTC)) {
 		t.Fatal("step cron should match 35")
 	}
 }

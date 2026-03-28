@@ -1,7 +1,7 @@
-import { Activity, Clock, FileCode2 } from 'lucide-react'
+import { Activity, Clock, FileCode2, Settings } from 'lucide-react'
 import type { ReactNode } from 'react'
 
-type Tab = 'jobs' | 'scripts' | 'runs'
+type Tab = 'jobs' | 'scripts' | 'runs' | 'settings'
 
 type MainTabsProps = {
   activeTab: Tab
@@ -14,6 +14,7 @@ export function MainTabs({ activeTab, onTabChange, counts }: MainTabsProps) {
     ['jobs', <Clock key="jobs" className="h-3.5 w-3.5" />, 'Cron Jobs'],
     ['scripts', <FileCode2 key="scripts" className="h-3.5 w-3.5" />, 'Scripts'],
     ['runs', <Activity key="runs" className="h-3.5 w-3.5" />, 'Run History'],
+    ['settings', <Settings key="settings" className="h-3.5 w-3.5" />, 'Settings'],
   ]
 
   return (
@@ -35,10 +36,10 @@ export function MainTabs({ activeTab, onTabChange, counts }: MainTabsProps) {
         >
           {icon}
           {label}
-          <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+          <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${
             activeTab === id ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
           }`}>
-            {counts[id]}
+            {id === 'settings' ? '—' : counts[id]}
           </span>
         </button>
       ))}

@@ -16,6 +16,7 @@ import {
   HardDrive,
   Info,
   Loader2,
+  Mail,
   Monitor,
   Pencil,
   Play,
@@ -36,6 +37,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import { Separator } from '@/components/ui/separator'
 import {
   Select,
   SelectContent,
@@ -44,13 +46,14 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { API_BASE_URL, apiFetch } from '@/lib/api'
+import { API_BASE_URL, apiFetch, getFetchErrorMessage } from '@/lib/api'
 import { getUxMetricsSnapshot, markJobCreateStarted, markJobCreated, markJobRunStarted, markLogsOpened } from '@/lib/uxMetrics'
 import { isRunFailure, isRunSuccess } from '@/features/runs/status'
 import { validateCron, validateJobName, validateCommand } from '@/features/jobs/validators'
 import { validateScriptName } from '@/features/scripts/validators'
 import { formatCountdown, nextRunFromCron } from '@/features/jobs/time'
 import { MainTabs } from '@/features/layout/MainTabs'
+import { NotificationSettings } from '@/features/settings/NotificationSettings'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +74,14 @@ type Job = {
   timezone?: string
   command: string; working_directory?: string; venv_path?: string; comment: string
   logging_enabled: boolean; timeout_seconds: number
+  heartbeat_token?: string
+  heartbeat_grace_seconds?: number
+  last_heartbeat_at?: string | null
+  heartbeat_status?: string
+  heartbeat_deadline_at?: string
+  heartbeat_prev_fire_at?: string
+  heartbeat_interval_seconds?: number
+  heartbeat_first_ping_due_by?: string
 }
 type Run = {
   id: string; job_id?: string; job_name: string
@@ -80,10 +91,10 @@ type Run = {
   failure_reason: string; failure_fix: string
 }
 type Preset = { label: string; schedule: string }
-type Tab = 'jobs' | 'scripts' | 'runs'
+type Tab = 'jobs' | 'scripts' | 'runs' | 'settings'
 type ScheduleMode = 'cron' | 'human' | 'both'
 type RunsResponse = { items: Run[]; total: number; limit: number; offset: number; has_more: boolean }
-const VALID_TABS: Tab[] = ['jobs', 'scripts', 'runs']
+const VALID_TABS: Tab[] = ['jobs', 'scripts', 'runs', 'settings']
 const VALID_RUN_FILTERS = ['all', 'running', 'success', 'failed'] as const
 type RunsFilter = (typeof VALID_RUN_FILTERS)[number]
 
@@ -117,6 +128,44 @@ function runDuration(r: Run): string {
   if (ms < 1000) return `${ms}ms`
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
   return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`
+}
+
+/** Full URL for POST heartbeat (uses page origin when API is same-origin). */
+function heartbeatRequestUrl(token: string): string {
+  const base = (API_BASE_URL.trim() !== '' ? API_BASE_URL : (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/$/, '')
+  return `${base}/api/heartbeat/${encodeURIComponent(token)}`
+}
+
+function formatHeartbeatTs(iso: string | null | undefined): string {
+  if (iso == null || iso === '') return '—'
+  try {
+    return new Date(iso).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'medium' })
+  } catch {
+    return String(iso)
+  }
+}
+
+function HeartbeatStatusBadge({ status }: { status?: string }) {
+  const s = (status || 'never').toLowerCase()
+  const cls =
+    s === 'healthy'
+      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+      : s === 'late'
+        ? 'bg-amber-50 border-amber-200 text-amber-800'
+        : s === 'dead'
+          ? 'bg-red-50 border-red-200 text-red-800'
+          : 'bg-muted/60 border-border/50 text-muted-foreground'
+  const label =
+    s === 'healthy' ? 'Heartbeat OK' : s === 'late' ? 'Heartbeat late' : s === 'dead' ? 'Heartbeat missed' : 'No ping yet'
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${cls}`}
+      title="Based on schedule, grace period, and last POST to the heartbeat URL"
+    >
+      <Activity className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
+      {label}
+    </span>
+  )
 }
 
 function formatLogSize(stdout: string, stderr: string) {
@@ -486,10 +535,11 @@ export default function App() {
   const [deletingScript, setDeletingScript] = useState<string | null>(null)
   const [deletingJob, setDeletingJob]       = useState<string | null>(null)
   const [runningJob, setRunningJob]         = useState<string | null>(null)
+  const [emailHistorySending, setEmailHistorySending] = useState(false)
 
   // ── Edit job ──────────────────────────────────────────────────────────────
   const [editingJobId, setEditingJobId]   = useState<string | null>(null)
-  const [editJob, setEditJob]             = useState({ name: '', schedule: '', timezone: 'Local', command: '', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300 })
+  const [editJob, setEditJob]             = useState({ name: '', schedule: '', timezone: 'Local', command: '', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300, heartbeat_grace_seconds: 300 })
   const [editJobErrors, setEditJobErrors] = useState({ name: '', schedule: '', command: '' })
   const [editJobSaving, setEditJobSaving] = useState(false)
 
@@ -502,6 +552,7 @@ export default function App() {
   const [newJob, setNewJob]       = useState({
     name: '', schedule: '*/5 * * * *', command: 'echo "cron test"',
     timezone: 'Local', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300,
+    heartbeat_grace_seconds: 300,
   })
   const [scriptErrors, setScriptErrors] = useState({ name: '' })
   const [jobErrors, setJobErrors]       = useState({ name: '', schedule: '', command: '' })
@@ -530,9 +581,34 @@ export default function App() {
       setApiOnline(true)
     } catch (err) {
       setApiOnline(false)
-      if (showSpinner) toast.error('Refresh failed', { description: err instanceof Error ? err.message : 'Unknown error' })
+      if (showSpinner) toast.error('Refresh failed', { description: getFetchErrorMessage(err) })
     } finally { if (showSpinner) setRefreshing(false) }
   }, [runsFilter, runsOffset, runsPageSize, runsSearch])
+
+  const emailFilteredRuns = useCallback(async () => {
+    const limit = Math.min(500, Math.max(1, runsTotal))
+    if (!window.confirm(`Send an email with up to ${limit} run(s) (newest first) matching your current filters to the addresses configured in Settings?`)) return
+    setEmailHistorySending(true)
+    try {
+      const res = await apiFetch<{ status: string; run_count?: number }>(`${API_BASE_URL}/api/runs/email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: runsFilter,
+          search: runsSearch.trim(),
+          job_id: '',
+          limit,
+        }),
+      })
+      toast.message('Run history email queued', {
+        description: `${res?.run_count ?? 0} run(s) included in the message.`,
+      })
+    } catch (e) {
+      toast.error('Email export failed', { description: getFetchErrorMessage(e) })
+    } finally {
+      setEmailHistorySending(false)
+    }
+  }, [runsFilter, runsSearch, runsTotal])
 
   useEffect(() => { refresh(); const t = setInterval(() => refresh(), 5000); return () => clearInterval(t) }, [refresh])
 
@@ -725,7 +801,7 @@ export default function App() {
       await apiFetch(`${API_BASE_URL}/api/jobs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newJob) })
       toast.success('Job created', { description: newJob.name })
       markJobCreated()
-      setNewJob({ name: '', schedule: '*/5 * * * *', timezone: 'Local', command: 'echo "cron test"', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300 })
+      setNewJob({ name: '', schedule: '*/5 * * * *', timezone: 'Local', command: 'echo "cron test"', working_directory: '', venv_path: '', comment: '', logging_enabled: true, timeout_seconds: 300, heartbeat_grace_seconds: 300 })
       setShowJobForm(false); refresh()
     } catch (err) { toast.error('Failed to create job', { description: err instanceof Error ? err.message : 'Unknown error' })
     } finally { setJobSaving(false) }
@@ -747,7 +823,7 @@ export default function App() {
   const startEditJob = (j: Job) => {
     setEditingJobId(j.id)
     setShowEditAdvanced(false)
-    setEditJob({ name: j.name, schedule: j.schedule, timezone: j.timezone ?? 'Local', command: j.command, working_directory: j.working_directory ?? '', venv_path: j.venv_path ?? '', comment: j.comment, logging_enabled: j.logging_enabled, timeout_seconds: j.timeout_seconds })
+    setEditJob({ name: j.name, schedule: j.schedule, timezone: j.timezone ?? 'Local', command: j.command, working_directory: j.working_directory ?? '', venv_path: j.venv_path ?? '', comment: j.comment, logging_enabled: j.logging_enabled, timeout_seconds: j.timeout_seconds, heartbeat_grace_seconds: j.heartbeat_grace_seconds ?? 300 })
     setEditJobErrors({ name: '', schedule: '', command: '' })
   }
 
@@ -787,6 +863,7 @@ export default function App() {
       comment: j.comment,
       logging_enabled: j.logging_enabled,
       timeout_seconds: j.timeout_seconds,
+      heartbeat_grace_seconds: j.heartbeat_grace_seconds ?? 300,
     })
     setJobErrors({ name: '', schedule: '', command: '' })
     setShowJobForm(true)
@@ -921,7 +998,7 @@ export default function App() {
       </header>
 
       {/* ── Body (sidebar + main) ─────────────────────────────────────────── */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
 
         {/* ── Left sidebar ───────────────────────────────────────────────── */}
         {sidebarOpen && (
@@ -1071,17 +1148,17 @@ export default function App() {
         </button>
 
         {/* ── Main content area ─────────────────────────────────────────── */}
-        <div className="flex-1 flex flex-col overflow-hidden bg-background">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
 
           {/* Tab bar */}
           <MainTabs
             activeTab={activeTab}
             onTabChange={setActiveTab}
-            counts={{ jobs: jobs.length, scripts: scripts.length, runs: runs.length }}
+            counts={{ jobs: jobs.length, scripts: scripts.length, runs: runs.length, settings: 0 }}
           />
 
-          {/* Tab content */}
-          <ScrollArea className="flex-1">
+          {/* Tab content — min-h-0 so flex gives a bounded height; ScrollArea can scroll */}
+          <ScrollArea className="min-h-0 flex-1">
             <div className="p-5">
 
               {/* ══════════════════════════════════════════════════════════ */}
@@ -1251,6 +1328,21 @@ export default function App() {
                                 onChange={e => setNewJob(j => ({ ...j, timeout_seconds: Math.max(1, parseInt(e.target.value) || 300) }))}
                                 className="h-8 text-xs w-36" />
                             </div>
+                            <div className="space-y-1">
+                              <Label htmlFor="job-hb-grace" className="text-xs text-muted-foreground">
+                                Heartbeat grace (seconds)
+                              </Label>
+                              <Input
+                                id="job-hb-grace"
+                                type="number"
+                                min={1}
+                                max={604800}
+                                value={newJob.heartbeat_grace_seconds}
+                                onChange={e => setNewJob(j => ({ ...j, heartbeat_grace_seconds: Math.min(604800, Math.max(1, parseInt(e.target.value, 10) || 300)) }))}
+                                className="h-8 text-xs w-40"
+                              />
+                              <p className="text-[10px] text-muted-foreground">Time after each scheduled slot to receive a POST before marking missed.</p>
+                            </div>
                             <label className="flex items-center gap-2 cursor-pointer select-none">
                               <div
                                 role="checkbox"
@@ -1390,6 +1482,20 @@ export default function App() {
                                         onChange={e => setEditJob(v => ({ ...v, timeout_seconds: Math.max(1, parseInt(e.target.value) || 300) }))}
                                         className="h-8 text-xs w-36" />
                                     </div>
+                                    <div className="space-y-1">
+                                      <Label htmlFor={`edit-hb-grace-${j.id}`} className="text-xs text-muted-foreground">
+                                        Heartbeat grace (seconds)
+                                      </Label>
+                                      <Input
+                                        id={`edit-hb-grace-${j.id}`}
+                                        type="number"
+                                        min={1}
+                                        max={604800}
+                                        value={editJob.heartbeat_grace_seconds}
+                                        onChange={e => setEditJob(v => ({ ...v, heartbeat_grace_seconds: Math.min(604800, Math.max(1, parseInt(e.target.value, 10) || 300)) }))}
+                                        className="h-8 text-xs w-40"
+                                      />
+                                    </div>
                                     <label className="flex items-center gap-2 cursor-pointer select-none">
                                       <div
                                         role="checkbox"
@@ -1444,6 +1550,7 @@ export default function App() {
                                     )
                                   return <RunBadge status={last.status} />
                                 })()}
+                                <HeartbeatStatusBadge status={j.heartbeat_status} />
                               </div>
 
                               {/* Command block */}
@@ -1513,6 +1620,30 @@ export default function App() {
                                       )
                                     })()}
                                   </div>
+                                  {j.heartbeat_token && (
+                                    <div className="rounded-md border border-teal-200/70 bg-teal-50/50 px-2 py-1.5 space-y-1">
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="text-[9px] font-bold uppercase tracking-wide text-teal-900">Heartbeat URL</span>
+                                        <Button
+                                          type="button"
+                                          variant="outline"
+                                          size="sm"
+                                          className="h-6 text-[10px] px-2"
+                                          onClick={() => copyToClipboard(heartbeatRequestUrl(j.heartbeat_token!))}
+                                        >
+                                          <Copy className="h-3 w-3 mr-1" aria-hidden="true" />
+                                          Copy URL
+                                        </Button>
+                                      </div>
+                                      <code className="block text-[10px] font-mono break-all text-teal-950/90 select-all" title="POST JSON or empty body after each successful run">
+                                        {heartbeatRequestUrl(j.heartbeat_token)}
+                                      </code>
+                                      <p className="text-[10px] text-muted-foreground leading-snug">
+                                        Grace period: {j.heartbeat_grace_seconds ?? 300}s · Last ping: {formatHeartbeatTs(j.last_heartbeat_at)}{' '}
+                                        · Ping expected by: {formatHeartbeatTs(j.heartbeat_deadline_at)}
+                                      </p>
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -1747,6 +1878,29 @@ export default function App() {
                         <SelectItem value="100">100 / page</SelectItem>
                       </SelectContent>
                     </Select>
+                    <Separator orientation="vertical" className="hidden h-6 sm:block" aria-hidden />
+                    <div className="flex flex-col gap-0.5 sm:items-start">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-[11px] gap-1.5 border-primary/20 bg-white hover:bg-primary/5 hover:border-primary/35"
+                        disabled={emailHistorySending || runsTotal === 0}
+                        onClick={() => void emailFilteredRuns()}
+                        aria-describedby="runs-email-export-hint"
+                        title="Sends up to 500 newest runs that match the current status filter and search. Configure SMTP under Settings."
+                      >
+                        {emailHistorySending ? (
+                          <Loader2 className="h-3.5 w-3.5 motion-safe:animate-spin shrink-0" aria-hidden />
+                        ) : (
+                          <Mail className="h-3.5 w-3.5 shrink-0 text-primary/80" aria-hidden />
+                        )}
+                        Email export
+                      </Button>
+                      <p id="runs-email-export-hint" className="text-[9px] text-muted-foreground leading-snug max-w-[200px] hidden sm:block">
+                        Plain-text summary to your Settings recipients (max 500 rows).
+                      </p>
+                    </div>
                   </div>
 
                   {runs.length === 0 ? (
@@ -1868,6 +2022,18 @@ export default function App() {
                     </Button>
                     </div>
                   )}
+                </div>
+              )}
+
+              {activeTab === 'settings' && (
+                <div role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
+                  <div className="sticky top-0 z-10 -mx-5 mb-4 border-b border-border/40 bg-background/95 px-5 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+                    <h1 className="text-[15px] font-bold tracking-tight text-amber-500 uppercase">Settings</h1>
+                    <p className="text-[11px] text-muted-foreground mt-0.5 max-w-lg leading-relaxed">
+                      Configure how CronSentinel sends mail: job alerts, test messages, and the Run history email export.
+                    </p>
+                  </div>
+                  <NotificationSettings />
                 </div>
               )}
 
