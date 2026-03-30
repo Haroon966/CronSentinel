@@ -132,7 +132,6 @@ func Classify(spec, timezone string, graceSeconds int, createdAt time.Time, last
 	}
 	grace := time.Duration(graceSeconds) * time.Second
 
-	loc := JobLocation(timezone)
 	if len(strings.Fields(spec)) != 5 {
 		out.Status = StatusDead
 		return out

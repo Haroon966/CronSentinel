@@ -9,6 +9,7 @@
 process.removeAllListeners('warning')
 
 const http      = require('http')
+const fs        = require('fs')
 const os        = require('os')
 const path      = require('path')
 const { execSync, spawn } = require('child_process')
@@ -86,7 +87,8 @@ try {
   db.prepare('INSERT OR IGNORE INTO notification_settings (id) VALUES (1)').run()
 } catch (_) {}
 
-try { db.exec(`ALTER TABLE notification_settings ADD COLUMN notify_heartbeat_missed INTEGER NOT NULL DEFAULT 0`) } catch (_) {}
+try { db.exec(`ALTER TABLE notification_settings ADD COLUMN notify_heartbeat_missed INTEGER NOT NULL DEFAULT 1`) } catch (_) {}
+try { db.exec(`UPDATE notification_settings SET notify_heartbeat_missed = 1 WHERE id = 1`) } catch (_) {}
 
 try { db.exec(`ALTER TABLE jobs ADD COLUMN heartbeat_token TEXT`) } catch (_) {}
 try { db.exec(`ALTER TABLE jobs ADD COLUMN heartbeat_grace_seconds INTEGER NOT NULL DEFAULT 300`) } catch (_) {}
@@ -151,6 +153,16 @@ if (jobCount.n === 0) {
     'cleanup-logs', '#!/usr/bin/env bash\nfind /tmp -name "*.log" -mtime +7 -delete', now)
 }
 
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS account_billing (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      plan_slug TEXT NOT NULL DEFAULT 'free'
+    );
+  `)
+  db.prepare('INSERT OR IGNORE INTO account_billing (id, plan_slug) VALUES (1, ?)').run('free')
+} catch (_) {}
+
 // ── Prepared statements ──────────────────────────────────────────────────────
 
 const stmts = {
@@ -191,6 +203,59 @@ const stmts = {
 /** Last successful heartbeat accept per token (ms) — mock rate limit 10s */
 const hbLastPing = new Map()
 
+/** In-memory per-job env vars (mock only; plaintext — real backend encrypts at rest). */
+const mockJobEnvVars = new Map()
+
+/** FEAT-16 parity: flat tiers (matches default embedded Go config shape). */
+const MOCK_PRICING = {
+  free: { display_name: 'Free', max_monitors: 50, max_alerts_per_month: 500, upgrade_url: 'https://cronsentinel.example/pricing' },
+  pro: { display_name: 'Pro', max_monitors: 500, max_alerts_per_month: 50000, upgrade_url: 'https://cronsentinel.example/pricing#pro' },
+}
+
+function getEffectivePlanSlug() {
+  const env = process.env.CRONSENTINEL_PLAN
+  if (env && String(env).trim()) return String(env).trim()
+  try {
+    const row = db.prepare('SELECT plan_slug FROM account_billing WHERE id = 1').get()
+    if (row && row.plan_slug) return String(row.plan_slug).trim()
+  } catch (_) {}
+  return 'free'
+}
+
+function getTierForSlug(slug) {
+  return MOCK_PRICING[slug] || MOCK_PRICING.free
+}
+
+function getBillingSnapshot() {
+  const slug = getEffectivePlanSlug()
+  const tier = getTierForSlug(slug)
+  const monitorsUsed = db.prepare('SELECT COUNT(*) AS n FROM jobs').get().n
+  const alertsSent = 0
+  const src = process.env.CRONSENTINEL_PLAN ? 'environment' : 'database'
+  const maxM = tier.max_monitors
+  const maxA = tier.max_alerts_per_month
+  return {
+    plan_slug: slug,
+    plan_display_name: tier.display_name,
+    plan_source: src,
+    max_monitors: maxM,
+    max_alerts_per_month: maxA,
+    monitors_used: monitorsUsed,
+    alerts_sent_this_month: alertsSent,
+    monitors_utilization: maxM > 0 ? monitorsUsed / maxM : 0,
+    alerts_utilization: maxA > 0 ? alertsSent / maxA : 0,
+    upgrade_url: tier.upgrade_url,
+    available_plan_slugs: Object.keys(MOCK_PRICING),
+  }
+}
+
+function maskMockEnvValue(plain) {
+  const s = String(plain ?? '')
+  if (s.length === 0) return '****'
+  if (s.length <= 4) return '*'.repeat(s.length)
+  return `****${s.slice(-4)}`
+}
+
 // ── SSE subscribers (in-memory — transient connections) ──────────────────────
 
 const subscribers = {}   // runId -> [res, ...]
@@ -200,7 +265,7 @@ const subscribers = {}   // runId -> [res, ...]
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Runs-Ingest-Token')
 }
 
 function json(res, code, body) {
@@ -263,19 +328,66 @@ function rowToJob(r) {
     heartbeat_prev_fire_at: d.toISOString(),
     heartbeat_interval_seconds: 60,
     heartbeat_first_ping_due_by: new Date(d.getTime() + 120_000).toISOString(),
+    alert_use_default_channels: true,
+    alert_channel_ids: [],
   }
+}
+
+function mockOsReleaseFields() {
+  let id = ''
+  let versionId = ''
+  let pretty = ''
+  try {
+    const s = fs.readFileSync('/etc/os-release', 'utf8')
+    for (const line of s.split('\n')) {
+      const m = line.match(/^(ID|VERSION_ID|PRETTY_NAME)=(.*)$/)
+      if (!m) continue
+      let v = m[2].trim()
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1)
+      if (m[1] === 'ID') id = v
+      else if (m[1] === 'VERSION_ID') versionId = v
+      else if (m[1] === 'PRETTY_NAME') pretty = v
+    }
+  } catch (_) {}
+  return { id, versionId, pretty }
 }
 
 function getDiskStats() {
   try {
     const output = execSync('df -P -k /', { encoding: 'utf8' })
-    const lines  = output.trim().split('\n')
+    const lines = output.trim().split('\n')
     if (lines.length < 2) return []
-    const parts      = lines[1].trim().split(/\s+/)
-    const mountpoint = parts[parts.length - 1] || '/'
+    const parts = lines[1].trim().split(/\s+/)
+    const blocks = Number.parseInt(parts[1], 10) || 0
+    const usedKb = Number.parseInt(parts[2], 10) || 0
+    const availKb = Number.parseInt(parts[3], 10) || 0
     const usedPercent = Number.parseFloat(String(parts[4] || '0').replace('%', ''))
-    return [{ path: mountpoint, used_percent: Number.isFinite(usedPercent) ? usedPercent : 0 }]
+    const mountpoint = parts[parts.length - 1] || '/'
+    return [{
+      path: mountpoint,
+      fstype: 'local',
+      total: blocks * 1024,
+      used: usedKb * 1024,
+      free: availKb * 1024,
+      used_percent: Number.isFinite(usedPercent) ? usedPercent : 0,
+    }]
   } catch { return [] }
+}
+
+function mockNetworkIfaces() {
+  const out = []
+  const ifs = os.networkInterfaces() || {}
+  for (const name of Object.keys(ifs)) {
+    if (name === 'lo') continue
+    out.push({
+      name,
+      bytes_sent: 0,
+      bytes_recv: 0,
+      packets_sent: 0,
+      packets_recv: 0,
+    })
+  }
+  return out
 }
 
 function diagnoseFailure(stderr, timedOut) {
@@ -376,15 +488,66 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── System info ───────────────────────────────────────────────────────────
+  if (method === 'GET' && path_ === '/api/settings/billing') {
+    return json(res, 200, { billing: getBillingSnapshot() })
+  }
+
+  if (method === 'PATCH' && path_ === '/api/settings/billing') {
+    if (process.env.CRONSENTINEL_PLAN) {
+      return json(res, 409, { error: 'Plan is controlled by CRONSENTINEL_PLAN; unset it to change plan in settings.' })
+    }
+    let body
+    try { body = await readBody(req) } catch { return json(res, 400, { error: 'invalid JSON' }) }
+    const slug = String(body.plan_slug || '').trim()
+    if (!slug) return json(res, 400, { error: 'plan_slug is required' })
+    if (!MOCK_PRICING[slug]) return json(res, 400, { error: `unknown plan_slug ${slug}` })
+    db.prepare('UPDATE account_billing SET plan_slug = ? WHERE id = 1').run(slug)
+    return json(res, 200, { ok: true, billing: getBillingSnapshot() })
+  }
+
   if (method === 'GET' && path_ === '/api/system') {
-    const totalMem = os.totalmem(), freeMem = os.freemem(), usedMem = totalMem - freeMem
+    const totalMem = os.totalmem()
+    const freeMem = os.freemem()
+    const usedMem = totalMem - freeMem
     const load = os.loadavg()
+    const cpus = os.cpus()
+    const rel = mockOsReleaseFields()
+    const plat = rel.id || os.type()
+    const platVer = rel.versionId || ''
+    const hostOS = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux'
+    const bootUnix = Math.max(0, Math.floor(Date.now() / 1000 - os.uptime()))
     return json(res, 200, {
       uptime_seconds: Math.floor(os.uptime()),
-      cpu_count:      os.cpus().length,
-      memory: { total: totalMem, used: usedMem, usedPercent: totalMem > 0 ? (usedMem / totalMem) * 100 : 0 },
-      load:   { load1: load[0] ?? 0, load5: load[1] ?? 0, load15: load[2] ?? 0 },
-      disks:  getDiskStats(),
+      cpu_count: cpus.length,
+      host: {
+        hostname: os.hostname(),
+        os: hostOS,
+        platform: plat,
+        platform_family: '',
+        platform_version: platVer,
+        kernel_version: os.release(),
+        kernel_arch: os.machine(),
+        boot_time_unix: bootUnix,
+        virtualization_system: '',
+        virtualization_role: '',
+      },
+      cpu: {
+        model_name: cpus[0]?.model || '',
+        logical_cores: cpus.length,
+        physical_cores: cpus.length,
+        mhz_max: cpus[0]?.speed ? cpus[0].speed : 0,
+      },
+      memory: {
+        total: totalMem,
+        used: usedMem,
+        free: freeMem,
+        used_percent: totalMem > 0 ? (usedMem / totalMem) * 100 : 0,
+      },
+      swap: { total: 0, used: 0, free: 0, used_percent: 0 },
+      load: { load1: load[0] ?? 0, load5: load[1] ?? 0, load15: load[2] ?? 0 },
+      disks: getDiskStats(),
+      network: mockNetworkIfaces(),
+      gpu: { status: 'unavailable', reason: 'mock backend does not probe GPU hardware' },
     })
   }
 
@@ -459,6 +622,11 @@ const server = http.createServer(async (req, res) => {
     if (!name)    return json(res, 400, { error: 'job name is required' })
     if (!command) return json(res, 400, { error: 'command is required' })
     if ((schedule.match(/\S+/g) || []).length !== 5) return json(res, 400, { error: 'invalid cron schedule — must be exactly 5 space-separated fields' })
+    const jobN = db.prepare('SELECT COUNT(*) AS n FROM jobs').get().n
+    const maxM = getTierForSlug(getEffectivePlanSlug()).max_monitors
+    if (jobN >= maxM) {
+      return json(res, 409, { error: 'Monitor limit reached for your current plan. Delete a job or upgrade.' })
+    }
     let grace = Number(body.heartbeat_grace_seconds)
     if (!Number.isFinite(grace) || grace <= 0) grace = 300
     if (grace > 604800) grace = 604800
@@ -513,10 +681,75 @@ const server = http.createServer(async (req, res) => {
     const job = stmts.jobById.get(id)
     if (!job) return json(res, 404, { error: 'job not found' })
     stmts.deleteJob.run(id)
+    mockJobEnvVars.delete(id)
     return json(res, 200, { ok: true })
   }
 
   // ── Run a job now ─────────────────────────────────────────────────────────
+  const jobEnvAgentMatch = path_.match(/^\/api\/jobs\/([^/]+)\/env\/agent$/)
+  if (method === 'GET' && jobEnvAgentMatch) {
+    const jobId = decodeURIComponent(jobEnvAgentMatch[1])
+    const job = stmts.jobById.get(jobId)
+    if (!job) return json(res, 404, { error: 'job not found' })
+    const h = String(req.headers.authorization || '')
+    const xTok = String(req.headers['x-runs-ingest-token'] || '').trim()
+    let bearer = ''
+    const m = h.match(/^Bearer\s+(\S+)/i)
+    if (m) bearer = m[1].trim()
+    const tok = bearer || xTok
+    if (!tok) return json(res, 401, { error: 'missing ingest token: use Authorization: Bearer <token> or X-Runs-Ingest-Token' })
+    // Mock backend does not persist runs_ingest_token; any non-empty token is accepted for local UI testing.
+    const inner = mockJobEnvVars.get(jobId) || new Map()
+    const env = {}
+    for (const [k, v] of inner) env[k] = v
+    return json(res, 200, { env })
+  }
+
+  const jobEnvMatch = path_.match(/^\/api\/jobs\/([^/]+)\/env$/)
+  if (jobEnvMatch) {
+    const jobId = decodeURIComponent(jobEnvMatch[1])
+    const job = stmts.jobById.get(jobId)
+    if (!job) return json(res, 404, { error: 'job not found' })
+    if (method === 'GET') {
+      const inner = mockJobEnvVars.get(jobId) || new Map()
+      const items = [...inner.entries()].map(([name, value]) => ({
+        name,
+        masked_value: maskMockEnvValue(value),
+        sensitive_hint: false,
+      }))
+      return json(res, 200, { items })
+    }
+    if (method === 'PUT') {
+      let body
+      try { body = await readBody(req) } catch { return json(res, 400, { error: 'invalid JSON' }) }
+      const name = String(body.name || '').trim()
+      const value = String(body.value ?? '')
+      if (!name) return json(res, 400, { error: 'name is required' })
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        return json(res, 400, { error: 'name must match [A-Za-z_][A-Za-z0-9_]*' })
+      }
+      if (!mockJobEnvVars.has(jobId)) mockJobEnvVars.set(jobId, new Map())
+      mockJobEnvVars.get(jobId).set(name, value)
+      return json(res, 200, {
+        ok: true,
+        name,
+        masked_value: maskMockEnvValue(value),
+        warnings: [],
+      })
+    }
+    if (method === 'DELETE') {
+      const name = String(url.searchParams.get('name') || '').trim()
+      if (!name) return json(res, 400, { error: 'name query parameter is required' })
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        return json(res, 400, { error: 'name must match [A-Za-z_][A-Za-z0-9_]*' })
+      }
+      const inner = mockJobEnvVars.get(jobId)
+      if (!inner || !inner.has(name)) return json(res, 404, { error: 'env var not found' })
+      inner.delete(name)
+      return json(res, 200, { ok: true })
+    }
+  }
+
   const runJobMatch = path_.match(/^\/api\/jobs\/([^/]+)\/run$/)
   if (method === 'POST' && runJobMatch) {
     const id  = decodeURIComponent(runJobMatch[1])
@@ -628,6 +861,27 @@ const server = http.createServer(async (req, res) => {
       body.notify_heartbeat_missed ? 1 : 0,
     )
     return json(res, 200, { ok: true })
+  }
+
+  if (method === 'GET' && path_ === '/api/settings/alert-channels') {
+    return json(res, 200, [])
+  }
+  if (method === 'POST' && path_ === '/api/settings/alert-channels') {
+    return json(res, 201, { ok: true, id: randomUUID() })
+  }
+  const alertChPatch = path_.match(/^\/api\/settings\/alert-channels\/([^/]+)$/)
+  if (alertChPatch && method === 'PATCH') {
+    return json(res, 200, { ok: true })
+  }
+  if (alertChPatch && method === 'DELETE') {
+    return json(res, 200, { ok: true })
+  }
+  const alertChTest = path_.match(/^\/api\/settings\/alert-channels\/([^/]+)\/test$/)
+  if (alertChTest && method === 'POST') {
+    return json(res, 200, { ok: true, status: 'sent' })
+  }
+  if (method === 'GET' && path_ === '/api/settings/alert-delivery-log') {
+    return json(res, 200, { items: [] })
   }
 
   if (method === 'POST' && path_ === '/api/settings/notifications/test') {

@@ -1,0 +1,5 @@
+.git
+.gitignore
+*.md
+# Test files are not needed in the build context
+*_test.go

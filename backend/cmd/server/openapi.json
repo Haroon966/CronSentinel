@@ -1,0 +1,104 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "CronSentinel REST API",
+    "version": "1.0.0",
+    "description": "Authenticated integration API. Send `Authorization: Bearer <api_key>` on every request. Response envelope: `{ \"data\", \"error\", \"meta\" }`."
+  },
+  "servers": [{ "url": "/api/v1" }],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API key"
+      }
+    },
+    "schemas": {
+      "Envelope": {
+        "type": "object",
+        "properties": {
+          "data": {},
+          "error": {
+            "oneOf": [{ "type": "null" }, { "$ref": "#/components/schemas/ApiError" }]
+          },
+          "meta": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "details": {}
+        }
+      }
+    }
+  },
+  "security": [{ "bearerAuth": [] }],
+  "paths": {
+    "/jobs": {
+      "get": {
+        "summary": "List jobs (cursor pagination)",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 50 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "post": {
+        "summary": "Create job",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "additionalProperties": true }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Created" },
+          "409": { "description": "Conflict — plan monitor limit reached" }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "get": { "summary": "Get job", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "200": { "description": "OK" } } },
+      "put": { "summary": "Update job", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "200": { "description": "OK" } } },
+      "delete": { "summary": "Delete job", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "200": { "description": "OK" } } }
+    },
+    "/jobs/{id}/heartbeat-token": {
+      "get": {
+        "summary": "Get heartbeat token",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/jobs/{id}/run": {
+      "post": {
+        "summary": "Trigger manual run",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK" }, "202": { "description": "Accepted" } }
+      }
+    },
+    "/runs": {
+      "get": {
+        "summary": "List runs",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "status", "in": "query", "schema": { "type": "string" } },
+          { "name": "job_id", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/runs/{id}": {
+      "get": {
+        "summary": "Get run detail",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK" } }
+      }
+    }
+  }
+}

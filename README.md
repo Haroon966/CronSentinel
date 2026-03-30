@@ -27,6 +27,18 @@ No cloud. No subscriptions. Runs entirely on your machine.
 
 ---
 
+## 📸 Screenshots
+
+| | |
+|:---:|:---:|
+| ![Dashboard](assets/Dashboard.png) | ![Cron jobs](assets/Cron-jobs.png) |
+| ![Scripts](assets/scripts.png) | ![Run history](assets/Run-History.png) |
+| ![Servers](assets/Servers.png) | ![Settings](assets/Settings.png) |
+
+See the [screenshot gallery](docs/screenshots.md) for labeled views and captions.
+
+---
+
 ## 🎬 Features at a Glance
 
 <div align="center">
@@ -41,7 +53,7 @@ No cloud. No subscriptions. Runs entirely on your machine.
 | 🖥️ | **System Monitor** | CPU, memory, disk, and load average in real time |
 | 🕐 | **Human Schedules** | Type `every 5 minutes` instead of `*/5 * * * *` |
 | ⚡ | **Preset Schedules** | One-click presets for common intervals |
-| ⏱️ | **Timeout Protection** | Auto-kill jobs that run too long |
+| ⏱️ | **Timeout Protection** | Server-side timed-out runs + optional agent SIGTERM before final timeout |
 | 🔍 | **Failure Analysis** | Each failed run shows cause and suggested fix |
 
 </div>
@@ -339,7 +351,7 @@ Go to the **Runs** tab to see every execution. Status badges explained:
 | Method | Endpoint | Description |
 |:---:|:---|:---|
 | `GET` | `/healthz` | Health check |
-| `GET` | `/api/system` | System info (CPU, memory, disk, load) |
+| `GET` | `/api/system` | Auto-detected system report (stable JSON): host/OS/kernel, CPU model and core counts, memory and swap, load, all visible filesystems, non-loopback network interfaces (counters), GPU when detectable (Linux DRM / optional `nvidia-smi`). Values reflect the process environment (e.g. container cgroup limits). |
 | `GET` | `/api/scripts` | List all scripts |
 | `POST` | `/api/scripts` | Create a script |
 | `DELETE` | `/api/scripts/:name` | Delete a script |
@@ -377,13 +389,15 @@ See the [LICENSE](./LICENSE) file for full legal text.
 
 ## 🤝 Contributing
 
-Pull requests are welcome! For major changes, please open an issue first to discuss what you'd like to change.
+Pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, guidelines, and the full workflow. For major changes, open an issue first to discuss what you would like to change.
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/amazing-feature`
 3. Commit your changes: `git commit -m 'Add amazing feature'`
 4. Push to the branch: `git push origin feature/amazing-feature`
 5. Open a Pull Request
+
+Security-sensitive reports: [SECURITY.md](SECURITY.md).
 
 ---
 

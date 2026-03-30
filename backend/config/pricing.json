@@ -1,0 +1,18 @@
+{
+  "tiers": [
+    {
+      "slug": "free",
+      "display_name": "Free",
+      "max_monitors": 50,
+      "max_alerts_per_month": 500,
+      "upgrade_url": "https://cronsentinel.example/pricing"
+    },
+    {
+      "slug": "pro",
+      "display_name": "Pro",
+      "max_monitors": 500,
+      "max_alerts_per_month": 50000,
+      "upgrade_url": "https://cronsentinel.example/pricing#pro"
+    }
+  ]
+}

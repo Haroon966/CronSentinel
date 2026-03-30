@@ -47,20 +47,20 @@ Each feature below is a self-contained unit. The Cursor agent will:
 
 - [x] FEAT-01 | Heartbeat Monitoring | Monitoring | MVP
 - [x] FEAT-02 | Absence-Based Alerting | Monitoring | MVP
-- [ ] FEAT-03 | Execution Log Capture | Monitoring | MVP
-- [ ] FEAT-04 | Live Status Dashboard | Monitoring | MVP
-- [ ] FEAT-05 | Execution History Log | Monitoring | MVP
-- [ ] FEAT-06 | Daemon & Server Heartbeat | Reliability | MVP
-- [ ] FEAT-07 | Crontab Change Detection | Reliability | MVP
-- [ ] FEAT-08 | Job Timeout & Kill Switch | Reliability | MVP
-- [ ] FEAT-09 | Visual Cron Builder | UX | MVP
-- [ ] FEAT-10 | Next-Run Previewer | UX | MVP
-- [ ] FEAT-11 | 60-Second Onboarding | UX | MVP
-- [ ] FEAT-12 | No-Redeploy Schedule Editor | UX | MVP
-- [ ] FEAT-13 | Secure Env Variable Manager | Security | MVP
-- [ ] FEAT-14 | Multi-Channel Alert Integrations | Integrations | MVP
-- [ ] FEAT-15 | REST API | Integrations | MVP
-- [ ] FEAT-16 | Predictable Flat Pricing | DevX | MVP
+- [x] FEAT-03 | Execution Log Capture | Monitoring | MVP
+- [x] FEAT-04 | Live Status Dashboard | Monitoring | MVP
+- [x] FEAT-05 | Execution History Log | Monitoring | MVP
+- [x] FEAT-06 | Daemon & Server Heartbeat | Reliability | MVP
+- [x] FEAT-07 | Crontab Change Detection | Reliability | MVP
+- [x] FEAT-08 | Job Timeout & Kill Switch | Reliability | MVP
+- [x] FEAT-09 | Visual Cron Builder | UX | MVP
+- [x] FEAT-10 | Next-Run Previewer | UX | MVP
+- [x] FEAT-11 | 60-Second Onboarding | UX | MVP
+- [x] FEAT-12 | No-Redeploy Schedule Editor | UX | MVP
+- [x] FEAT-13 | Secure Env Variable Manager | Security | MVP
+- [x] FEAT-14 | Multi-Channel Alert Integrations | Integrations | MVP
+- [x] FEAT-15 | REST API | Integrations | MVP
+- [x] FEAT-16 | Predictable Flat Pricing | DevX | MVP
 
 ---
 
@@ -265,6 +265,7 @@ Each feature below contains full context for implementation.
 ### FEAT-11 — 60-Second Onboarding
 **Problem:** Monitoring tools take hours to configure. First value takes too long.  
 **Solution:** Guided wizard that gets a user's first job monitored in under 60 seconds.  
+**Note:** Step 3 email uses existing SMTP notification settings; optional Slack is deferred to FEAT-14 (copy-only in the wizard).  
 **Acceptance Criteria:**
 - Onboarding wizard shown to new users on first login (skippable)
 - Step 1: Name your job + enter cron schedule
@@ -289,6 +290,8 @@ Each feature below contains full context for implementation.
 - Confirmation dialog for changes to active jobs
 - Validation: invalid cron expressions rejected with inline error
 - Full error handling: save failure shows error toast with retry option
+
+**Implementation note:** `job_config_audit.actor` is stored as empty string until authenticated users exist; diffs are still recorded with timestamps.
 
 ---
 
@@ -813,7 +816,22 @@ Each feature below contains full context for implementation.
 > Features that have been fully implemented, tested, and are in production.
 
 - **2026-03-28** — FEAT-01 | Heartbeat Monitoring | Monitoring | MVP
-- **2026-03-28** — FEAT-02 | Absence-Based Alerting | Monitoring | MVP
+- **2026-03-28** — FEAT-02 | Absence-Based Alerting | Monitoring | MVP (updated 2026-03-30: default `notify_heartbeat_missed=true`; unique `(job_id, scheduled_fire_at)` + insert-before-dispatch for multi-replica idempotency)
+- **2026-03-28** — FEAT-03 | Execution Log Capture | Monitoring | MVP
+- **2026-03-29** — FEAT-04 | Live Status Dashboard | Monitoring | MVP
+- **2026-03-29** — FEAT-05 | Execution History Log | Monitoring | MVP
+- **2026-03-29** — FEAT-06 | Daemon & Server Heartbeat | Reliability | MVP
+- **2026-03-29** — FEAT-07 | Crontab Change Detection | Reliability | MVP
+- **2026-03-29** — FEAT-08 | Job Timeout & Kill Switch | Reliability | MVP (`timeout_remote_kill_enabled`; agent polls `GET /api/jobs/:id/runs/pending-kill` + `POST .../kill-ack` with runs ingest token; 90s grace then `timed_out`; see [docs/agent-wrapper.md](docs/agent-wrapper.md); local execution + DB sweeper)
+- **2026-03-29** — FEAT-09 | Visual Cron Builder | UX | MVP
+- **2026-03-29** — FEAT-10 | Next-Run Previewer | UX | MVP
+- **2026-03-29** — FEAT-11 | 60-Second Onboarding | UX | MVP (wizard + `GET/PATCH /api/settings/onboarding` on `account_billing` merged with localStorage)
+- **2026-03-29** — FEAT-12 | No-Redeploy Schedule Editor | UX | MVP (`enabled` + `job_config_audit`; modal editor; optimistic save + retry; confirm on schedule/monitoring change for healthy jobs)
+- **2026-03-29** — FEAT-13 | Secure Env Variable Manager | Security | MVP (AES-256-GCM at rest via `CRONSENTINEL_ENV_ENCRYPTION_KEY` or dev-derived key; `job_env_vars`; UI masked values + warnings; `GET/PUT/DELETE /api/jobs/:id/env`; agent `GET .../env/agent` with run-ingest token; log redaction on ingest + local runs; mock-backend parity)
+- **2026-03-29** — FEAT-14 | Multi-Channel Alert Integrations | Integrations | MVP (`alert_channels`, `job_alert_channels`, `alert_delivery_log`; Slack + generic webhook + Twilio SMS; encrypted configs; unified dispatch with 3× exponential backoff; SMTP remains singleton `notification_settings`; per-job routing + SMTP sentinel `11111111-1111-1111-1111-111111111111`; `CRONSENTINEL_PUBLIC_BASE_URL` for UI links; Settings UI + edit-job channel picker; API `GET/POST/PATCH/DELETE /api/settings/alert-channels`, test + delivery log)
+- **2026-03-30** — FEAT-15 | REST API | Integrations | MVP (`api_keys` table; bcrypt-hashed keys; `GET/POST/DELETE /api/settings/api-keys`; Bearer auth + 1000 req/hour per key on `/api/v1/*`; jobs/runs CRUD + cursor pagination + `GET /jobs/:id/heartbeat-token` + manual run; `{data,error,meta}` envelope; `/api/openapi.json` + `/api/docs` Swagger UI; Settings UI `ApiKeysSettings`)
+- **2026-03-30** — FEAT-16 | Predictable Flat Pricing | DevX | MVP (`account_billing`; embedded `internal/pricing/default_pricing.json` + `CRONSENTINEL_PRICING_CONFIG` override; `CRONSENTINEL_PLAN` env overrides DB plan; `GET/PATCH /api/settings/billing`; monitor cap on `POST /api/jobs` + `POST /api/v1/jobs` (409 / `plan_limit_exceeded`); monthly alert cap in `notify.Dispatcher`; Settings `BillingSettings` + ≥80% banner; mock-backend parity)
+- **UI/UX Reviewed — 2026-03-29** — FEAT-12 pass: Arctic/Obsidian tokens + DM Sans / IBM Plex Mono + `data-theme` (`cs-theme`); edit-job confirm via `AlertDialog`; dialog overlay/shadow/radius; `CronExpressionHelper` / `NextRunPreviewer` typography and token-colored surfaces; theme toggle in main tabs. Files: [frontend/src/index.css](frontend/src/index.css), [frontend/src/main.tsx](frontend/src/main.tsx), [frontend/index.html](frontend/index.html), [frontend/src/components/theme-provider.tsx](frontend/src/components/theme-provider.tsx), [frontend/src/components/ui/dialog.tsx](frontend/src/components/ui/dialog.tsx), [frontend/src/components/ui/alert-dialog.tsx](frontend/src/components/ui/alert-dialog.tsx), [frontend/src/components/ui/sonner.tsx](frontend/src/components/ui/sonner.tsx), [frontend/src/features/layout/MainTabs.tsx](frontend/src/features/layout/MainTabs.tsx), [frontend/src/features/layout/ThemeToggle.tsx](frontend/src/features/layout/ThemeToggle.tsx), [frontend/src/App.tsx](frontend/src/App.tsx), [frontend/src/features/jobs/CronExpressionHelper.tsx](frontend/src/features/jobs/CronExpressionHelper.tsx), [frontend/src/features/jobs/NextRunPreviewer.tsx](frontend/src/features/jobs/NextRunPreviewer.tsx), [ui-audit-FEAT-12.md](ui-audit-FEAT-12.md).
 
 ---
 

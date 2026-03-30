@@ -24,6 +24,8 @@ export type NotificationSettingsDTO = {
   notify_manual_success: boolean
   notify_manual_failure: boolean
   notify_heartbeat_missed: boolean
+  notify_server_unreachable: boolean
+  notify_crontab_changed: boolean
 }
 
 const emptyForm = (): Omit<NotificationSettingsDTO, 'smtp_password_set'> & { smtp_password: string } => ({
@@ -39,7 +41,9 @@ const emptyForm = (): Omit<NotificationSettingsDTO, 'smtp_password_set'> & { smt
   notify_scheduled_failure: false,
   notify_manual_success: false,
   notify_manual_failure: false,
-  notify_heartbeat_missed: false,
+  notify_heartbeat_missed: true,
+  notify_server_unreachable: true,
+  notify_crontab_changed: true,
 })
 
 type ToggleRowProps = {
@@ -54,7 +58,7 @@ function ToggleRow({ id, checked, onChange, title, description }: ToggleRowProps
   return (
     <label
       htmlFor={id}
-      className="flex gap-3 rounded-lg border border-border/50 bg-white p-3.5 cursor-pointer transition-colors hover:bg-muted/25 focus-within:ring-2 focus-within:ring-primary/30 focus-within:ring-offset-1"
+      className="flex gap-3 rounded-lg border border-border/50 bg-card p-3.5 cursor-pointer transition-colors hover:bg-muted/25 focus-within:ring-2 focus-within:ring-primary/30 focus-within:ring-offset-1"
     >
       <input
         id={id}
@@ -108,6 +112,8 @@ export function NotificationSettings() {
         notify_manual_success: s.notify_manual_success,
         notify_manual_failure: s.notify_manual_failure,
         notify_heartbeat_missed: Boolean(s.notify_heartbeat_missed),
+        notify_server_unreachable: s.notify_server_unreachable !== false,
+        notify_crontab_changed: s.notify_crontab_changed !== false,
       })
     } catch (e) {
       const msg = getFetchErrorMessage(e)
@@ -165,6 +171,8 @@ export function NotificationSettings() {
           notify_manual_success: form.notify_manual_success,
           notify_manual_failure: form.notify_manual_failure,
           notify_heartbeat_missed: form.notify_heartbeat_missed,
+          notify_server_unreachable: form.notify_server_unreachable,
+          notify_crontab_changed: form.notify_crontab_changed,
         }),
       })
       toast.success('Settings saved', { description: 'Notification preferences were updated.' })
@@ -207,7 +215,7 @@ export function NotificationSettings() {
   if (loading) {
     return (
       <div
-        className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border/60 bg-white py-16 text-muted-foreground"
+        className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border/60 bg-card py-16 text-muted-foreground"
         role="status"
         aria-live="polite"
         aria-busy="true"
@@ -246,13 +254,17 @@ export function NotificationSettings() {
     <div className="max-w-2xl space-y-4 pb-8">
       <Card className="overflow-hidden border-border/60 py-0 gap-0 shadow-xs">
         <CardHeader className="space-y-1 border-b border-border/40 bg-gradient-to-r from-amber-500/5 to-transparent px-5 py-4">
-          <CardTitle className="flex items-center gap-2 text-[15px] font-bold tracking-tight text-amber-600 uppercase">
-            <Mail className="h-4 w-4 text-amber-500 shrink-0" aria-hidden />
+          <CardTitle className="flex items-center gap-2 text-base font-semibold tracking-tight text-primary uppercase">
+            <Mail className="h-4 w-4 shrink-0 text-primary" aria-hidden />
             Email notifications
           </CardTitle>
           <CardDescription className="text-[11px] leading-relaxed">
             Get alerts when jobs finish and use the same mail server for <strong className="font-medium text-foreground/80">Run history → Email history</strong>.
-            Optional env override:{' '}
+            Any SMTP relay works (including{' '}
+            <a href="https://resend.com/docs/send-with-smtp" className="underline underline-offset-2 text-primary" target="_blank" rel="noreferrer">
+              Resend SMTP
+            </a>
+            ). Optional env override:{' '}
             <code className="rounded bg-muted px-1 py-px text-[10px] font-mono text-foreground/90">NOTIFICATION_SMTP_PASSWORD</code>
           </CardDescription>
         </CardHeader>
@@ -275,7 +287,7 @@ export function NotificationSettings() {
               }`}
             >
               <span
-                className={`pointer-events-none absolute top-0.5 left-0.5 block h-[22px] w-[22px] rounded-full bg-white shadow transition-transform motion-reduce:transition-none ${
+                className={`pointer-events-none absolute top-0.5 left-0.5 block h-[22px] w-[22px] rounded-full bg-card shadow transition-transform motion-reduce:transition-none ${
                   form.enabled ? 'translate-x-[26px]' : 'translate-x-0'
                 }`}
               />
@@ -283,7 +295,7 @@ export function NotificationSettings() {
             </button>
           </div>
           {!form.enabled && (
-            <div className="mx-5 mb-4 rounded-md border border-amber-200/80 bg-amber-50/80 px-3 py-2 text-[11px] text-amber-900">
+            <div className="mx-5 mb-4 rounded-md border border-[var(--cs-late-border)] bg-[var(--cs-late-bg)] px-3 py-2 text-xs text-[var(--cs-late-text)]">
               <span className="font-medium">Heads up:</span> alerts and test emails stay disabled until you turn this on and save.
             </div>
           )}
@@ -344,7 +356,7 @@ export function NotificationSettings() {
           </div>
           <div className="space-y-1.5 sm:col-span-2">
             <Label htmlFor="smtp-pass" className="text-xs font-medium">
-              Password <span className="font-normal text-muted-foreground">(optional)</span>
+              Password <span className="font-normal text-muted-foreground">(mandatory to send emails)</span>
             </Label>
             <Input
               id="smtp-pass"
@@ -428,7 +440,7 @@ export function NotificationSettings() {
           </p>
           <div className="flex flex-col gap-6 sm:flex-row sm:items-stretch sm:gap-0">
             <div className="min-w-0 flex-1 space-y-3">
-              <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-amber-600/90">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--cs-late-text)]">
                 <CalendarClock className="h-3.5 w-3.5 shrink-0" aria-hidden />
                 Scheduled runs
               </div>
@@ -452,7 +464,7 @@ export function NotificationSettings() {
             <Separator orientation="horizontal" className="sm:hidden" />
             <Separator orientation="vertical" className="mx-5 hidden w-px shrink-0 self-stretch sm:block min-h-[148px]" />
             <div className="min-w-0 flex-1 space-y-3">
-              <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-amber-600/90">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--cs-late-text)]">
                 <Hand className="h-3.5 w-3.5 shrink-0" aria-hidden />
                 Manual runs
               </div>
@@ -481,6 +493,20 @@ export function NotificationSettings() {
             onChange={v => setForm(f => ({ ...f, notify_heartbeat_missed: v }))}
             title="Missed heartbeat"
             description="Email when a job does not POST to its heartbeat URL within the schedule window plus grace period."
+          />
+          <ToggleRow
+            id="notify-srv-down"
+            checked={form.notify_server_unreachable}
+            onChange={v => setForm(f => ({ ...f, notify_server_unreachable: v }))}
+            title="Server unreachable"
+            description="Email when a registered host stops POSTing to its server heartbeat URL for more than three minutes (daemon or machine down — not the same as a job heartbeat miss)."
+          />
+          <ToggleRow
+            id="notify-crontab"
+            checked={form.notify_crontab_changed}
+            onChange={v => setForm(f => ({ ...f, notify_crontab_changed: v }))}
+            title="Crontab changed"
+            description="Email when a crontab snapshot from a registered server differs from the previous one (includes a line diff when both reads succeeded)."
           />
         </CardContent>
         <CardFooter className="flex flex-col gap-3 border-t border-border/40 bg-muted/10 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">

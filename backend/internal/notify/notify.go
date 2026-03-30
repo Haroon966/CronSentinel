@@ -31,22 +31,28 @@ type Settings struct {
 	NotifyManualSuccess     bool
 	NotifyManualFailure     bool
 	NotifyHeartbeatMissed   bool
+	NotifyServerUnreachable bool
+	NotifyCrontabChanged    bool
 }
 
 // Load reads the singleton notification_settings row.
 func Load(ctx context.Context, db *pgxpool.Pool) (*Settings, error) {
 	var s Settings
 	err := db.QueryRow(ctx, `
-select enabled, coalesce(smtp_host,''), smtp_port, coalesce(smtp_username,''), coalesce(smtp_password,''),
-       smtp_tls, coalesce(from_address,''), coalesce(to_addresses,''),
-       notify_scheduled_success, notify_scheduled_failure, notify_manual_success, notify_manual_failure,
-       coalesce(notify_heartbeat_missed, false)
+	select enabled, coalesce(smtp_host,''), smtp_port, coalesce(smtp_username,''), coalesce(smtp_password,''),
+	       smtp_tls, coalesce(from_address,''), coalesce(to_addresses,''),
+	       notify_scheduled_success, notify_scheduled_failure, notify_manual_success, notify_manual_failure,
+	       coalesce(notify_heartbeat_missed, false),
+	       coalesce(notify_server_unreachable, true),
+	       coalesce(notify_crontab_changed, true)
 from notification_settings where id = $1
 `, settingsRowID).Scan(
 		&s.Enabled, &s.SMTPHost, &s.SMTPPort, &s.SMTPUsername, &s.SMTPPassword,
 		&s.SMTPTLS, &s.FromAddress, &s.ToAddresses,
 		&s.NotifyScheduledSuccess, &s.NotifyScheduledFailure, &s.NotifyManualSuccess, &s.NotifyManualFailure,
 		&s.NotifyHeartbeatMissed,
+		&s.NotifyServerUnreachable,
+		&s.NotifyCrontabChanged,
 	)
 	if err != nil {
 		return nil, err
@@ -107,27 +113,44 @@ func ShouldNotifyRun(s *Settings, trigger, status string) bool {
 	}
 	t := strings.ToLower(strings.TrimSpace(trigger))
 	st := strings.ToLower(strings.TrimSpace(status))
-	if st != "success" && st != "failure" {
+	if st != "success" && st != "failure" && st != "timed_out" {
 		return false
 	}
+	failish := st == "failure" || st == "timed_out"
 	if t == "scheduled" {
 		if st == "success" {
 			return s.NotifyScheduledSuccess
 		}
-		return s.NotifyScheduledFailure
+		if failish {
+			return s.NotifyScheduledFailure
+		}
+		return false
 	}
 	if t == "manual" {
 		if st == "success" {
 			return s.NotifyManualSuccess
 		}
-		return s.NotifyManualFailure
+		if failish {
+			return s.NotifyManualFailure
+		}
+		return false
 	}
 	return false
 }
 
-// ShouldNotifyHeartbeatMissed reports whether missed-heartbeat alerts are enabled and SMTP is usable.
+// ShouldNotifyHeartbeatMissed reports whether missed-heartbeat alerts are enabled (any transport is checked via TransportAvailable).
 func ShouldNotifyHeartbeatMissed(s *Settings) bool {
-	return s != nil && s.Enabled && s.NotifyHeartbeatMissed && CanSend(s) && HasCredentials(s)
+	return s != nil && s.Enabled && s.NotifyHeartbeatMissed
+}
+
+// ShouldNotifyServerUnreachable reports whether server-down alerts are enabled.
+func ShouldNotifyServerUnreachable(s *Settings) bool {
+	return s != nil && s.Enabled && s.NotifyServerUnreachable
+}
+
+// ShouldNotifyCrontabChanged reports whether crontab diff alerts are enabled.
+func ShouldNotifyCrontabChanged(s *Settings) bool {
+	return s != nil && s.Enabled && s.NotifyCrontabChanged
 }
 
 // FormatHeartbeatMissed builds subject and body for a missed heartbeat alert.
@@ -148,6 +171,47 @@ func FormatHeartbeatMissed(jobName, status, scheduledRFC, deadlineRFC string, mi
 	return subject, b.String()
 }
 
+// FormatServerUnreachable builds subject and body for a monitored server that stopped heartbeating.
+// This is intentionally distinct from job missed-heartbeat copy.
+func FormatServerUnreachable(serverName, lastSeenRFC string, minutesSincePing int) (subject, body string) {
+	subject = fmt.Sprintf("[CronSentinel] Server unreachable — %s", serverName)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Alert type: server heartbeat (daemon / host)\n")
+	fmt.Fprintf(&b, "Server: %s\n", serverName)
+	if lastSeenRFC != "" {
+		fmt.Fprintf(&b, "Last seen: %s\n", lastSeenRFC)
+	} else {
+		b.WriteString("Last seen: (never — no successful ping yet)\n")
+	}
+	fmt.Fprintf(&b, "Minutes since last ping: %d\n", minutesSincePing)
+	b.WriteString("\nThis is not a per-job missed heartbeat. The host or agent should POST to the server heartbeat URL about every 60 seconds.\n")
+	return subject, b.String()
+}
+
+// FormatCrontabChanged builds subject and body when a monitored host's crontab snapshot changes.
+func FormatCrontabChanged(serverName, userContext, diffText string) (subject, body string) {
+	subject = fmt.Sprintf("[CronSentinel] Crontab changed — %s", serverName)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Alert type: crontab snapshot (deploy / user edit detection)\n")
+	fmt.Fprintf(&b, "Server: %s\n", serverName)
+	if strings.TrimSpace(userContext) != "" {
+		fmt.Fprintf(&b, "User / context: %s\n", strings.TrimSpace(userContext))
+	}
+	b.WriteString("\n--- Change summary / diff ---\n")
+	d := strings.TrimSpace(diffText)
+	if d == "" {
+		b.WriteString("(no diff text — content fingerprint changed)\n")
+	} else {
+		if len(d) > maxSnippet {
+			d = d[:maxSnippet] + "\n… (truncated)"
+		}
+		b.WriteString(d)
+		b.WriteByte('\n')
+	}
+	b.WriteString("\nThis is separate from job heartbeats and server reachability.\n")
+	return subject, b.String()
+}
+
 const smtpMaxAttempts = 3
 
 // SendPlainWithRetry attempts SendPlain up to smtpMaxAttempts times with backoff between failures.
@@ -159,7 +223,8 @@ func SendPlainWithRetry(s *Settings, subject, body string) error {
 			return nil
 		}
 		if attempt < smtpMaxAttempts {
-			time.Sleep(time.Duration(attempt) * time.Second)
+			// exponential backoff: 1s, 2s
+			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
 		}
 	}
 	return fmt.Errorf("smtp failed after %d attempts: %w", smtpMaxAttempts, lastErr)
@@ -169,15 +234,27 @@ const maxSnippet = 4000
 
 // FormatRunCompleted builds subject and plain body for a single run.
 func FormatRunCompleted(jobName, command, status string, runID string, exitCode *int, failureReason, stdout, stderr string) (subject, body string) {
-	subject = fmt.Sprintf("[CronSentinel] %s — %s", jobName, strings.ToUpper(status))
+	st := strings.ToLower(strings.TrimSpace(status))
+	if st == "timed_out" {
+		subject = fmt.Sprintf("[CronSentinel] Timed out — %s", jobName)
+	} else {
+		subject = fmt.Sprintf("[CronSentinel] %s — %s", jobName, strings.ToUpper(status))
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Job: %s\nRun ID: %s\nStatus: %s\n", jobName, runID, status)
+	if st == "timed_out" {
+		fmt.Fprintf(&b, "Alert type: job execution timeout\n")
+	}
 	if exitCode != nil {
 		fmt.Fprintf(&b, "Exit code: %d\n", *exitCode)
 	}
 	fmt.Fprintf(&b, "Command: %s\n", command)
 	if failureReason != "" {
-		fmt.Fprintf(&b, "Failure reason: %s\n", failureReason)
+		if st == "timed_out" {
+			fmt.Fprintf(&b, "Timeout detail: %s\n", failureReason)
+		} else {
+			fmt.Fprintf(&b, "Failure reason: %s\n", failureReason)
+		}
 	}
 	if stdout != "" {
 		sn := stdout

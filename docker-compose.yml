@@ -23,11 +23,19 @@ services:
       PORT: 8080
       SCRIPT_DIR: /data/scripts
       DATABASE_URL: postgres://postgres:postgres@db:5432/cronsentinel?sslmode=disable
+      # Production: 32-byte AES key as 64-char hex or base64 (see envcrypto.LoadKey). Omit for dev-only derived key.
+      # CRONSENTINEL_ENV_ENCRYPTION_KEY: ""
       # Optional: override SMTP password from Settings (Docker secret / env file)
       # NOTIFICATION_SMTP_PASSWORD: ""
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     ports:
       - "8080:8080"
     volumes:
@@ -38,16 +46,18 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     environment:
-      # Browser talks to localhost:8080; leave unset in dev to use Vite proxy + CRONSENTINEL_DEV_API_PROXY
-      VITE_API_BASE_URL: http://localhost:8080
+      # Do not set VITE_API_BASE_URL in dev: the browser calls /api on :5173 and Vite proxies to the backend
+      # (works from any host/IP that can reach the dev server; avoids localhost:8080 mismatches).
       # Vite dev server (in this container) proxies /api to the backend service
       CRONSENTINEL_DEV_API_PROXY: http://backend:8080
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
       - "5173:5173"
     volumes:
       - ./frontend:/app
+      # Preserved across rebuilds; stale deps fixed by frontend/docker-entrypoint-dev.sh (npm ci when package-lock.json changes)
       - /app/node_modules
 
 volumes:

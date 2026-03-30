@@ -43,6 +43,7 @@ function messageForHttpStatus(status: number): string {
   if (status === 408 || status === 504) return 'The server took too long to respond. Try again.'
   if (status >= 500) return `Server error (${status}). Try again in a moment.`
   if (status === 400) return 'The server could not accept this request.'
+  if (status === 409) return 'This request conflicts with current limits or state.'
   return `Request failed (${status}).`
 }
 
@@ -50,8 +51,14 @@ function parseErrorPayload(text: string, status: number): string {
   const fallback = messageForHttpStatus(status)
   if (!text.trim()) return fallback
   try {
-    const j = JSON.parse(text) as { error?: string; message?: string }
+    const j = JSON.parse(text) as {
+      error?: string | { message?: string; code?: string }
+      message?: string
+    }
     if (typeof j.error === 'string' && j.error.trim()) return j.error.trim()
+    if (j.error && typeof j.error === 'object' && typeof j.error.message === 'string' && j.error.message.trim()) {
+      return j.error.message.trim()
+    }
     if (typeof j.message === 'string' && j.message.trim()) return j.message.trim()
   } catch {
     const snippet = text.slice(0, 200).trim()
@@ -91,4 +98,73 @@ export async function apiFetch<T = unknown>(url: string, opts?: RequestInit): Pr
       bodySnippet: text.slice(0, 200),
     })
   }
+}
+
+/** Download binary/text response (e.g. CSV) without JSON parsing. */
+export async function downloadBlob(url: string, filename: string): Promise<void> {
+  let res: Response
+  try {
+    res = await fetch(url)
+  } catch (e) {
+    if (e instanceof Error && e.name === 'AbortError') {
+      throw new Error('The request was cancelled.', { cause: e })
+    }
+    throw new Error(
+      'Cannot reach the server. Check that the API is running and your network connection.',
+      { cause: e },
+    )
+  }
+
+  const text = await res.text()
+  if (!res.ok) {
+    const msg = parseErrorPayload(text, res.status)
+    throw new ApiError(msg, res.status, { bodySnippet: text ? text.slice(0, 500) : undefined })
+  }
+
+  const blob = new Blob([text], { type: res.headers.get('Content-Type') ?? 'application/octet-stream' })
+  const u = URL.createObjectURL(blob)
+  try {
+    const a = document.createElement('a')
+    a.href = u
+    a.download = filename
+    a.rel = 'noopener'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  } finally {
+    URL.revokeObjectURL(u)
+  }
+}
+
+export type ApiKeyListItem = {
+  id: string
+  name: string
+  key_prefix: string
+  created_at: string
+  revoked_at: string | null
+}
+
+export async function fetchApiKeys(): Promise<ApiKeyListItem[]> {
+  const res = await apiFetch<{ items?: ApiKeyListItem[] }>(`${API_BASE_URL}/api/settings/api-keys`)
+  return Array.isArray(res?.items) ? res.items : []
+}
+
+export type CreateApiKeyResponse = {
+  id: string
+  name: string
+  key: string
+  key_prefix: string
+  created_at: string
+}
+
+export async function createApiKey(name: string): Promise<CreateApiKeyResponse> {
+  return apiFetch<CreateApiKeyResponse>(`${API_BASE_URL}/api/settings/api-keys`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+}
+
+export async function revokeApiKey(id: string): Promise<void> {
+  await apiFetch(`${API_BASE_URL}/api/settings/api-keys/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
