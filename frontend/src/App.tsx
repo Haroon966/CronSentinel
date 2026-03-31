@@ -78,6 +78,7 @@ import { getUxMetricsSnapshot, markJobCreateStarted, markJobCreated, markJobRunS
 import { rangeFromPreset, parseRunsRangePreset, type RunsRangePreset } from '@/features/runs/dateRangePresets'
 import { isRunFailure, isRunSuccess, isRunTimedOut } from '@/features/runs/status'
 import { LogHighlighter } from '@/features/runs/LogHighlighter'
+import { DurationTrendChart } from '@/features/runs/DurationTrendChart'
 import { CronExpressionHelper } from '@/features/jobs/CronExpressionHelper'
 import { validateCron, validateJobName, validateCommand } from '@/features/jobs/validators'
 import { validateScriptName } from '@/features/scripts/validators'
@@ -3079,6 +3080,9 @@ export default function App() {
               {/* ══════════════════════════════════════════════════════════ */}
               {activeTab === 'runs' && (
                 <div role="tabpanel" id="panel-runs" aria-labelledby="tab-runs">
+                  {runsJobId.trim() && (
+                    <DurationTrendChart jobId={runsJobId.trim()} />
+                  )}
                   {apiOnline === false && (
                     <div
                       role="alert"

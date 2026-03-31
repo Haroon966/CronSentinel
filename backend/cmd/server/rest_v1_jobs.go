@@ -340,6 +340,7 @@ func (a *app) v1ListJobs(c *gin.Context) {
 		var name, schedule, timezone, workingDir, cmd, comment string
 		var logEnabled bool
 		var timeout int
+		var remoteKill bool
 		var jobEnabled bool
 		var created time.Time
 		var grace, successExit int
@@ -350,14 +351,14 @@ func (a *app) v1ListJobs(c *gin.Context) {
 		var lrStatus sql.NullString
 		var lrStarted sql.NullTime
 		var lrDur sql.NullInt64
-		if err := rows.Scan(&id, &name, &schedule, &timezone, &workingDir, &cmd, &comment, &logEnabled, &timeout, &jobEnabled, &created,
+		if err := rows.Scan(&id, &name, &schedule, &timezone, &workingDir, &cmd, &comment, &logEnabled, &timeout, &remoteKill, &jobEnabled, &created,
 			&grace, &lastN, &successExit, &useDefAlert, &alertChCSV, &hasHB,
 			&lrStatus, &lrStarted, &lrDur); err != nil {
 			slog.Error("v1ListJobs scan", "err", err)
 			writeV1Error(c, http.StatusInternalServerError, "server_error", "failed to read job row", nil)
 			return
 		}
-		h := jobGinSanitized(now, id, name, schedule, timezone, workingDir, cmd, comment, logEnabled, timeout, jobEnabled, created,
+		h := jobGinSanitized(now, id, name, schedule, timezone, workingDir, cmd, comment, logEnabled, timeout, remoteKill, jobEnabled, created,
 			grace, lastN, successExit, useDefAlert, alertChCSV, hasHB, lrStatus, lrStarted, lrDur)
 		out = append(out, h)
 		if len(out) == limit {

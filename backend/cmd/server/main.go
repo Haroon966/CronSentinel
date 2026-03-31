@@ -206,6 +206,7 @@ func main() {
 	r.DELETE("/api/jobs/:id", a.deleteJob)
 	r.POST("/api/jobs/:id/run", a.runJobManual)
 	r.POST("/api/jobs/:id/runs", a.postJobRunIngest)
+	r.GET("/api/jobs/:id/runs/duration-trend", a.getDurationTrend)
 	r.GET("/api/jobs/:id/runs/pending-kill", a.getPendingKill)
 	r.POST("/api/jobs/:id/runs/:runId/kill-ack", a.postKillAck)
 	r.GET("/api/jobs/:id/env/agent", a.getJobEnvForAgent)
