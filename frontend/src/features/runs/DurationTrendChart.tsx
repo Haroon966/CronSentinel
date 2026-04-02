@@ -119,6 +119,7 @@ function DurationTooltip({ active, payload }: TooltipRenderProps) {
     timeStyle: 'short',
   })
   const statusLabel =
+  
     d.status === 'timed_out' ? 'Timed Out' : d.status.charAt(0).toUpperCase() + d.status.slice(1)
   return (
     <div
